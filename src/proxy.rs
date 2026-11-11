@@ -1153,7 +1153,7 @@ async fn stream_proxy(
                     &client,
                     &model,
                     &path_query,
-                    "200",
+                    resp.status().as_str(),
                     Some(permit.lane_idx),
                     t0,
                 );
