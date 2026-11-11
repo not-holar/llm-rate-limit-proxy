@@ -86,6 +86,7 @@ pub async fn view(
                 "rpm": k.rpm,
                 "owner": k.owner,
             })).collect::<Vec<_>>(),
+            "no_v1": p.no_v1,
         })).collect::<Vec<_>>(),
         "clients": store.clients.iter().filter(|c| admin || c.owner == me).map(|c| json!({
             "label": c.label,
@@ -224,6 +225,8 @@ pub enum ProviderAction {
         /// existing callers keep working unchanged.
         #[serde(default)]
         protocol: config::Protocol,
+        #[serde(default, deserialize_with = "deserialize_checkbox")]
+        no_v1: bool,
     },
     Remove {
         name: String,
@@ -232,6 +235,26 @@ pub enum ProviderAction {
         name: String,
         base_url: String,
     },
+}
+
+fn deserialize_checkbox<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrBool {
+        String(String),
+        Boolean(bool),
+    }
+
+    match StringOrBool::deserialize(deserializer)? {
+        StringOrBool::Boolean(b) => Ok(b),
+        StringOrBool::String(string) => match string.trim().to_lowercase().as_str() {
+            "on" | "true" | "1" | "yes" => Ok(true),
+            _ => Ok(false),
+        },
+    }
 }
 
 /// Add, remove, or re-point an upstream provider.
@@ -252,6 +275,7 @@ pub async fn providers(
                 key,
                 rpm,
                 protocol,
+                no_v1,
             } => {
                 let name = name.trim().to_string();
                 let key = key.trim().to_string();
@@ -282,6 +306,7 @@ pub async fn providers(
                         rpm,
                         owner: String::new(),
                     }],
+                    no_v1,
                 });
             }
             ProviderAction::Remove { name } => {

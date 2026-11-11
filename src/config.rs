@@ -87,6 +87,8 @@ pub struct Provider {
     /// written before this field existed loads unchanged.
     #[serde(default)]
     pub protocol: Protocol,
+    #[serde(default)]
+    pub no_v1: bool,
 }
 
 /// The request shape an upstream expects, and that a client sends.
@@ -321,6 +323,7 @@ mod tests {
                     rpm: 40,
                     owner: "admin".into(),
                 }],
+                no_v1: false,
             }],
             clients: vec![],
             aliases: vec![],

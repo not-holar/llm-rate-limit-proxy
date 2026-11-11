@@ -54,6 +54,8 @@ pub struct SetupForm {
     /// what the wizard's form posts when the field is left alone.
     #[serde(default)]
     protocol: Option<config::Protocol>,
+    #[serde(default)]
+    no_v1: bool,
 }
 
 pub async fn setup_submit(
@@ -95,6 +97,7 @@ pub async fn setup_submit(
                 rpm: 40,
                 owner: form.username.clone(),
             }],
+            no_v1: form.no_v1,
         });
         store.clients.push(client_rec);
         if let Err(e) = config::save(&state.data_dir, &store) {

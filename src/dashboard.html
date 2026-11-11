@@ -391,6 +391,10 @@
           <option value="anthropic">anthropic</option>
         </select>
         <input name="rpm" type="number" value="40" min="1" max="10000" size="5" title="requests per minute">
+        <label style="width:100%">
+          <input name="no_v1" value="true" type="checkbox" switch>
+          Do not add &sol;v1&sol; prefix automatically (For services not recognising such paths, e.g. Google AI Studio)
+        </label>
         <button type="submit">add provider</button>
       </form>
     </div>
@@ -754,9 +758,10 @@
     fill("cfg-providers", provs.length ? table(provs.map((p) => [
       p.name, p.base_url, p.protocol || "openai",
       `${p.keys.length} key${p.keys.length === 1 ? "" : "s"}`,
+      `/v1 ${!p.no_v1 ? "" : "not "}included.`,
       actionBtn("remove", true, () => act("/api/settings/providers",
         { action: "remove", name: p.name }, `provider ${p.name} removed`)),
-    ]), ["provider", "base url", "protocol", "keys", ""]) : null, "no providers configured");
+    ]), ["provider", "base url", "protocol", "keys", `\/v1\/`, ""]) : null, "no providers configured");
 
     const keyRows = [];
     for (const p of provs) {

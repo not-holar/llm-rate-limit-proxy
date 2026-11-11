@@ -15,6 +15,7 @@ pub struct Permit {
     pub base_url: String,
     pub key: String,
     pub protocol: Protocol,
+    pub no_v1: bool,
 }
 
 pub struct Dispatcher {
@@ -100,6 +101,7 @@ impl Dispatcher {
                         base_url: lane.base_url.clone(),
                         key: lane.key.clone(),
                         protocol: lane.protocol,
+                        no_v1: lane.no_v1,
                     });
                 }
             }
@@ -128,6 +130,7 @@ mod tests {
             key: format!("{name}-key"),
             rpm,
             protocol: Default::default(),
+            no_v1: false,
         }
     }
 

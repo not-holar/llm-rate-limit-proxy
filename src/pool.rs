@@ -76,6 +76,7 @@ pub struct Lane {
     pub key: String,
     pub rpm: usize,
     pub protocol: Protocol,
+    pub no_v1: bool,
     limiter: Mutex<SlidingWindow>,
     cooldown_until: Mutex<Option<Instant>>,
 }
@@ -90,6 +91,7 @@ impl Lane {
             key: spec.key,
             rpm: spec.rpm,
             protocol: spec.protocol,
+            no_v1: spec.no_v1,
         }
     }
 
@@ -144,6 +146,7 @@ pub struct LaneSpec {
     pub key: String,
     pub rpm: usize,
     pub protocol: Protocol,
+    pub no_v1: bool,
 }
 
 /// Flatten every enabled, non-zero-rpm key across all providers into lane specs.
@@ -158,6 +161,7 @@ pub fn lane_specs(sc: &StoredConfig) -> Vec<LaneSpec> {
                     key: k.key.clone(),
                     rpm: k.rpm,
                     protocol: p.protocol,
+                    no_v1: p.no_v1,
                 });
             }
         }
@@ -312,6 +316,7 @@ mod tests {
                 rpm,
                 owner: "admin".into(),
             }],
+            no_v1: false,
         }
     }
 
@@ -352,6 +357,7 @@ mod tests {
                 key: format!("key-{i}"),
                 rpm: 40,
                 protocol: Default::default(),
+                no_v1: false,
             })
             .collect()
     }

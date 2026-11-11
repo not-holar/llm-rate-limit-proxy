@@ -377,6 +377,11 @@ fn build_request(
     fwd_headers: &[(String, String)],
     body: Bytes,
 ) -> reqwest::RequestBuilder {
+    let path_query = if permit.no_v1 {
+        path_query.strip_prefix("/v1").unwrap_or(path_query)
+    } else {
+        path_query
+    };
     let url = format!("{}{}", permit.base_url, path_query);
     let mut rb = state.http.request(method.clone(), &url);
     for (n, v) in fwd_headers {
