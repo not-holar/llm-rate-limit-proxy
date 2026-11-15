@@ -19,6 +19,7 @@ pub const JITTER_MARGIN: Duration = Duration::from_secs(1);
 
 /// Exact "N requests per rolling `window`" limiter. Time is injected so behavior
 /// is deterministically testable without real waiting.
+#[derive(Debug)]
 pub struct SlidingWindow {
     limit: usize,
     window: Duration,
@@ -70,6 +71,7 @@ impl SlidingWindow {
 }
 
 /// One upstream lane: an API key on a provider, with its own limiter.
+#[derive(Debug)]
 pub struct Lane {
     pub provider: String,
     pub base_url: String,

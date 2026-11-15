@@ -120,11 +120,7 @@ fn is_retryable(status: u16) -> bool {
 /// what the caller meant, and being tolerant here costs a user nothing while
 /// saving them an afternoon.
 fn normalize_path(path_query: &str) -> String {
-    let mut out = path_query.to_string();
-    while let Some(rest) = out.strip_prefix("/v1/v1/") {
-        out = format!("/v1/{rest}");
-    }
-    out
+    format!("/v1{}", path_query.to_string().trim_start_matches("/v1"))
 }
 
 /// The Anthropic API version to send when a client did not pick one. Pinned
@@ -205,31 +201,40 @@ async fn admit_model(
 /// path the proxy forwards verbatim, and the provider answers a bare 404 that
 /// names nothing. Seeing `/v1/v1/chat/completions` in the log is the difference
 /// between diagnosing that in seconds and guessing at it for an afternoon.
-fn record(
-    state: &AppState,
-    client: &str,
-    model: &str,
-    path: &str,
-    status: &str,
+struct RecordArgs<'a> {
+    client: &'a str,
+    virtual_model: &'a str,
+    actual_model: Option<&'a str>,
+    path: &'a str,
+    status: &'a str,
     lane: Option<usize>,
     started: Instant,
-) {
-    state.metrics.record_request(client, model, status);
+}
+
+fn record(state: &AppState, args: RecordArgs<'_>) {
+    state
+        .metrics
+        .record_request(args.client, args.virtual_model, args.status);
     // Which key carried it. For a key-rotation proxy this is the one field that
     // answers "is rotation actually spreading load", and its absence hides a
     // pool quietly collapsing onto one key.
-    let key = match lane {
+    let key = match args.lane {
         Some(i) => format!("key#{i}"),
         None => "-".to_string(),
     };
     println!(
-        "{status} {client} {key} {model} {path} ({} ms)",
-        started.elapsed().as_millis()
+        "📨 Status: {} | Client: {} | API key: {key} | Model: {} -> {:?} | Path: {} ({} ms)",
+        args.status,
+        args.client,
+        args.virtual_model,
+        args.actual_model,
+        args.path,
+        args.started.elapsed().as_millis()
     );
 }
 
 /// Cooldown for a lane the provider rebuffed without saying for how long.
-const DEFAULT_BENCH: Duration = Duration::from_secs(5);
+const DEFAULT_BENCH: Duration = Duration::from_secs(61);
 
 /// Take the rebuffed lane out of rotation for as long as the provider asked, or
 /// a short default. A key that just answered 429 will answer the same way to the
@@ -244,7 +249,7 @@ fn bench_lane(state: &AppState, lane_idx: usize, model: &str, status: u16, heade
         // request finally ended. Without this line an operator can see that the
         // governor engaged but has no way to count the pushback behind it.
         println!(
-            "  retry {status} {} key#{lane_idx} {model} (benched {}s)",
+            "  ✋ retry {status} {} key#{lane_idx} {model} (benched {}s)",
             lane.provider,
             cooldown.as_secs()
         );
@@ -255,6 +260,7 @@ fn bench_lane(state: &AppState, lane_idx: usize, model: &str, status: u16, heade
 
 /// One attempt in a request's routing plan: which provider to target (any if
 /// `None`) and what model to send (unchanged if `None`).
+#[derive(Debug)]
 struct PlanStep {
     provider: Option<String>,
     model: Option<String>,
@@ -587,7 +593,18 @@ pub async fn handle(
                 "no context window observed yet for any model",
             );
         };
-        record(&state, &client, "props", &path_query, "200", None, t0);
+        record(
+            &state,
+            RecordArgs {
+                client: &client,
+                virtual_model: "props",
+                actual_model: None,
+                path: &path_query,
+                status: "200",
+                lane: None,
+                started: t0,
+            },
+        );
         return Json(serde_json::json!({
             "default_generation_settings": { "n_ctx": n_ctx },
             "n_ctx": n_ctx,
@@ -685,7 +702,18 @@ pub async fn handle(
         let step_model = step.model.as_deref().unwrap_or(&model_label);
         let Some(_model_permit) = admit_model(&state, step_model, deadline, || true).await else {
             state.metrics.record_event("deadline");
-            record(&state, &client, &model_label, &path_query, "504", None, t0);
+            record(
+                &state,
+                RecordArgs {
+                    client: &client,
+                    virtual_model: &model_label,
+                    actual_model: Some(step_model),
+                    path: &path_query,
+                    status: "504",
+                    lane: None,
+                    started: t0,
+                },
+            );
             return deadline_exceeded();
         };
         let queued_at = Instant::now();
@@ -699,7 +727,18 @@ pub async fn handle(
         {
             None => {
                 state.metrics.record_event("deadline");
-                record(&state, &client, &model_label, &path_query, "504", None, t0);
+                record(
+                    &state,
+                    RecordArgs {
+                        client: &client,
+                        virtual_model: &model_label,
+                        actual_model: Some(step_model),
+                        path: &path_query,
+                        status: "504",
+                        lane: None,
+                        started: t0,
+                    },
+                );
                 return deadline_exceeded();
             }
             Some(None) => continue, // no eligible lane for this target
@@ -725,39 +764,83 @@ pub async fn handle(
             Some(r) => r,
             None => {
                 state.metrics.record_event("deadline");
-                record(&state, &client, &model_label, &path_query, "504", None, t0);
+                record(
+                    &state,
+                    RecordArgs {
+                        client: &client,
+                        virtual_model: &model_label,
+                        actual_model: Some(step_model),
+                        path: &path_query,
+                        status: "504",
+                        lane: None,
+                        started: t0,
+                    },
+                );
                 return deadline_exceeded();
             }
         };
         match sent {
             Ok(resp) => {
-                if is_retryable(resp.status().as_u16()) {
+                dbg!();
+                let status = resp.status().as_u16();
+                let headers = resp.headers().to_owned();
+                let payload = resp.bytes().await.unwrap_or_default();
+
+                // println!("{payload:#?}");
+
+                // let status = serde_json::from_slice::<serde_json::Value>(&payload)
+                //     .ok()
+                //     .as_ref()
+                //     .and_then(serde_json::Value::as_array)
+                //     .and_then(|x| {
+                //         x.iter()
+                //             .find_map(|x| x.as_object().and_then(|x| x.get("error")))
+                //     })
+                //     .and_then(serde_json::Value::as_object)
+                //     .and_then(|x| x.get("code"))
+                //     .inspect(|error_code| {
+                //         println!("JSON-encoded error hidden as success, code: {error_code:?}")
+                //     })
+                //     .and_then(serde_json::Value::as_u64)
+                //     .map(u16::try_from)
+                //     .and_then(Result::ok)
+                //     .inspect(|x| {
+                //         dbg!(*x);
+                //     })
+                //     // .and_then(|x| {
+                //     //     StatusCode::from_u16(x)
+                //     //         .inspect_err(|x| {
+                //     //             eprintln!("JSON-encoded error has an incorrect status code ({x}).")
+                //     //         })
+                //     //         .ok()
+                //     // })
+                //     .unwrap_or(status);
+
+                if is_retryable(status) {
                     // Bench even on the last step: this request is out of options,
                     // but the next one shouldn't walk into the same wall.
-                    bench_lane(
-                        &state,
-                        permit.lane_idx,
-                        step_model,
-                        resp.status().as_u16(),
-                        resp.headers(),
-                    );
+                    bench_lane(&state, permit.lane_idx, step_model, status, &headers);
                     state
                         .governor
                         .note_rebuff(step_model, permit.lane_idx, Instant::now());
                     if !is_last {
                         excluded.push(permit.lane_idx);
+                        println!("🚫 Lane {} added to the exclude list", permit.lane_idx);
                         continue;
                     }
                 }
-                let status = resp.status().as_u16();
+
                 record(
                     &state,
-                    &client,
-                    &model_label,
-                    &path_query,
-                    &status.to_string(),
-                    Some(permit.lane_idx),
-                    t0,
+                    RecordArgs {
+                        client: &client,
+                        virtual_model: &model_label,
+                        actual_model: Some(step_model),
+                        path: &path_query,
+                        status: &status.to_string(),
+                        lane: Some(permit.lane_idx),
+                        started: t0,
+                    },
                 );
                 state
                     .metrics
@@ -777,21 +860,31 @@ pub async fn handle(
                 // in and stopped there. Calling elapsed() here measured the gap
                 // between two adjacent statements — always zero, which is
                 // exactly what the tokens/sec column showed.
-                return relay(&state, &model_label, upstream_at, resp).await;
+                return relay(
+                    &state,
+                    &model_label,
+                    upstream_at,
+                    (status, headers, payload),
+                )
+                .await;
             }
             Err(e) => {
                 if !is_last {
                     excluded.push(permit.lane_idx);
+                    println!("🚫 Lane {} added to the exclude list", permit.lane_idx);
                     continue;
                 }
                 record(
                     &state,
-                    &client,
-                    &model_label,
-                    &path_query,
-                    "502",
-                    Some(permit.lane_idx),
-                    t0,
+                    RecordArgs {
+                        client: &client,
+                        virtual_model: &model_label,
+                        actual_model: Some(step_model),
+                        path: &path_query,
+                        status: "502",
+                        lane: Some(permit.lane_idx),
+                        started: t0,
+                    },
                 );
                 return err(
                     StatusCode::BAD_GATEWAY,
@@ -801,7 +894,19 @@ pub async fn handle(
             }
         }
     }
-    record(&state, &client, &model_label, &path_query, "503", None, t0);
+    record(
+        &state,
+        RecordArgs {
+            client: &client,
+            virtual_model: &model_label,
+            actual_model: None,
+            path: &path_query,
+            status: "503",
+            lane: None,
+            started: t0,
+        },
+    );
+    println!("no provider lane available for the requested model");
     err(
         StatusCode::SERVICE_UNAVAILABLE,
         "no_capacity",
@@ -847,17 +952,15 @@ async fn relay(
     state: &Arc<AppState>,
     model: &str,
     gen_start: Instant,
-    upstream: reqwest::Response,
+    (status, headers, payload): (u16, HeaderMap, Bytes),
 ) -> Response {
-    let status =
-        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut out = HeaderMap::new();
-    if let Some(ct) = upstream.headers().get(reqwest::header::CONTENT_TYPE) {
+    if let Some(ct) = headers.get(reqwest::header::CONTENT_TYPE) {
         if let Ok(v) = HeaderValue::from_bytes(ct.as_bytes()) {
             out.insert(header::CONTENT_TYPE, v);
         }
     }
-    let payload = upstream.bytes().await.unwrap_or_default();
     let gen_ms = gen_start.elapsed().as_millis() as u64;
     // A refusal for being too long is the only place the real context window is
     // ever stated. Catch it in passing so the catalog can publish it afterwards.
@@ -1055,137 +1158,199 @@ async fn stream_proxy(
     let last = plan.len().saturating_sub(1);
     let mut excluded: Vec<usize> = Vec::new();
     let mut retried_plain = false;
-    for (i, step) in plan.iter().enumerate() {
-        let is_last = i == last;
-        // Heartbeat while waiting on model pressure: the 200 is already committed,
-        // so a silent wait here would look like a hung stream to the client.
-        let step_model = step.model.as_deref().unwrap_or(&model);
-        let beat = || tx.try_send(heartbeat_frame()).is_ok() || !tx.is_closed();
-        let Some(_model_permit) = admit_model(&state, step_model, deadline, beat).await else {
-            state.metrics.record_event("deadline");
-            record(&state, &client, &model, &path_query, "504", None, t0);
-            let _ = tx.send(sse_error("deadline_exceeded")).await;
-            return;
-        };
-        let queued_at = Instant::now();
-        let permit = match acquire_for_heartbeating(
-            &state,
-            step.provider.as_deref(),
-            &excluded,
-            session,
-            wire,
-            deadline,
-            &tx,
-        )
-        .await
-        {
-            Ok(Some(p)) => {
-                state
-                    .metrics
-                    .record_queue_wait(queued_at.elapsed().as_millis() as u64);
-                p
-            }
-            Ok(None) => continue,
-            Err(()) => {
+    loop {
+        for (i, step) in plan.iter().enumerate() {
+            let is_last = i == last;
+            // Heartbeat while waiting on model pressure: the 200 is already committed,
+            // so a silent wait here would look like a hung stream to the client.
+            let step_model = step.model.as_deref().unwrap_or(&model);
+
+            println!("Trying model {step_model}.");
+
+            let beat = || tx.try_send(heartbeat_frame()).is_ok() || !tx.is_closed();
+
+            let Some(_model_permit) = admit_model(&state, step_model, deadline, beat).await else {
                 state.metrics.record_event("deadline");
-                record(&state, &client, &model, &path_query, "504", None, t0);
+                record(
+                    &state,
+                    RecordArgs {
+                        client: &client,
+                        virtual_model: &model,
+                        actual_model: Some(step_model),
+                        path: &path_query,
+                        status: "504",
+                        lane: None,
+                        started: t0,
+                    },
+                );
+
                 let _ = tx.send(sse_error("deadline_exceeded")).await;
                 return;
-            }
-        };
-        // The send time comes back with the response so time-to-first-token is
-        // measured from the attempt that actually produced it, not from the
-        // first attempt of a step that retried.
-        let (sent, upstream_at) = loop {
-            let attempt_at = Instant::now();
-            let out_body = rewrite_model(&body, step.model.as_deref());
-            let send = build_request(
+            };
+
+            let queued_at = Instant::now();
+            let permit = match acquire_for_heartbeating(
                 &state,
-                &permit,
-                &rq_method,
-                &path_query,
-                &fwd_headers,
-                out_body,
+                step.provider.as_deref(),
+                &excluded,
+                session,
+                wire,
+                deadline,
+                &tx,
             )
-            .send();
-            let sent = match with_deadline(deadline, send).await {
-                Some(r) => r,
-                None => {
+            .await
+            {
+                Ok(Some(p)) => {
+                    state
+                        .metrics
+                        .record_queue_wait(queued_at.elapsed().as_millis() as u64);
+                    p
+                }
+                Ok(None) => continue,
+                Err(()) => {
                     state.metrics.record_event("deadline");
-                    record(&state, &client, &model, &path_query, "504", None, t0);
+                    record(
+                        &state,
+                        RecordArgs {
+                            client: &client,
+                            virtual_model: &model,
+                            actual_model: Some(step_model),
+                            path: &path_query,
+                            status: "504",
+                            lane: None,
+                            started: t0,
+                        },
+                    );
                     let _ = tx.send(sse_error("deadline_exceeded")).await;
                     return;
                 }
             };
-            // A 400 right after we added `stream_options` points at this model
-            // rejecting the field. Retry this same step with the client's original
-            // body — a rejection we caused must not become the client's error.
-            if matches!(&sent, Ok(r) if r.status() == reqwest::StatusCode::BAD_REQUEST)
-                && fallback.is_some()
-            {
-                body = fallback.take().expect("checked above");
-                retried_plain = true;
-                continue;
-            }
-            break (sent, attempt_at);
-        };
-        match sent {
-            Ok(resp) => {
-                if is_retryable(resp.status().as_u16()) {
-                    bench_lane(
+            // The send time comes back with the response so time-to-first-token is
+            // measured from the attempt that actually produced it, not from the
+            // first attempt of a step that retried.
+            let (sent, upstream_at) = loop {
+                let attempt_at = Instant::now();
+                let out_body = rewrite_model(&body, step.model.as_deref());
+                let send = build_request(
+                    &state,
+                    &permit,
+                    &rq_method,
+                    &path_query,
+                    &fwd_headers,
+                    out_body,
+                )
+                .send();
+                let sent = match with_deadline(deadline, send).await {
+                    Some(r) => r,
+                    None => {
+                        state.metrics.record_event("deadline");
+                        record(
+                            &state,
+                            RecordArgs {
+                                client: &client,
+                                virtual_model: &model,
+                                actual_model: Some(step_model),
+                                path: &path_query,
+                                status: "504",
+                                lane: None,
+                                started: t0,
+                            },
+                        );
+                        let _ = tx.send(sse_error("deadline_exceeded")).await;
+                        return;
+                    }
+                };
+                // A 400 right after we added `stream_options` points at this model
+                // rejecting the field. Retry this same step with the client's original
+                // body — a rejection we caused must not become the client's error.
+                if matches!(&sent, Ok(r) if r.status() == reqwest::StatusCode::BAD_REQUEST)
+                    && fallback.is_some()
+                {
+                    body = fallback.take().expect("checked above");
+                    retried_plain = true;
+                    continue;
+                }
+                break (sent, attempt_at);
+            };
+            match sent {
+                Ok(resp) => {
+                    if is_retryable(resp.status().as_u16()) {
+                        bench_lane(
+                            &state,
+                            permit.lane_idx,
+                            step_model,
+                            resp.status().as_u16(),
+                            resp.headers(),
+                        );
+                        state
+                            .governor
+                            .note_rebuff(step_model, permit.lane_idx, Instant::now());
+                        if !is_last {
+                            excluded.push(permit.lane_idx);
+                            continue;
+                        }
+                    }
+                    // Only learn from a retry that actually worked. Recording the model
+                    // on the 400 alone would blame our injection for a body the client
+                    // simply got wrong, and permanently give up exact token counts.
+                    if retried_plain && resp.status().is_success() {
+                        state.no_inject.lock().unwrap().insert(model.clone());
+                    }
+                    record(
                         &state,
-                        permit.lane_idx,
-                        step_model,
-                        resp.status().as_u16(),
-                        resp.headers(),
+                        RecordArgs {
+                            client: &client,
+                            virtual_model: &model,
+                            actual_model: Some(step_model),
+                            path: &path_query,
+                            status: resp.status().as_str(),
+                            lane: Some(permit.lane_idx),
+                            started: t0,
+                        },
                     );
-                    state
-                        .governor
-                        .note_rebuff(step_model, permit.lane_idx, Instant::now());
+                    state.metrics.record_lane(&permit.provider);
+                    stream_body(&state, &model, upstream_at, resp, deadline, &tx).await;
+                    return;
+                }
+                Err(_) => {
                     if !is_last {
                         excluded.push(permit.lane_idx);
                         continue;
                     }
+                    record(
+                        &state,
+                        RecordArgs {
+                            client: &client,
+                            virtual_model: &model,
+                            actual_model: Some(step_model),
+                            path: &path_query,
+                            status: "502",
+                            lane: Some(permit.lane_idx),
+                            started: t0,
+                        },
+                    );
+                    let _ = tx.send(sse_error("upstream_error")).await;
+                    return;
                 }
-                // Only learn from a retry that actually worked. Recording the model
-                // on the 400 alone would blame our injection for a body the client
-                // simply got wrong, and permanently give up exact token counts.
-                if retried_plain && resp.status().is_success() {
-                    state.no_inject.lock().unwrap().insert(model.clone());
-                }
-                record(
-                    &state,
-                    &client,
-                    &model,
-                    &path_query,
-                    resp.status().as_str(),
-                    Some(permit.lane_idx),
-                    t0,
-                );
-                state.metrics.record_lane(&permit.provider);
-                stream_body(&state, &model, upstream_at, resp, deadline, &tx).await;
-                return;
-            }
-            Err(_) => {
-                if !is_last {
-                    excluded.push(permit.lane_idx);
-                    continue;
-                }
-                record(
-                    &state,
-                    &client,
-                    &model,
-                    &path_query,
-                    "502",
-                    Some(permit.lane_idx),
-                    t0,
-                );
-                let _ = tx.send(sse_error("upstream_error")).await;
-                return;
             }
         }
+
+        println!("Ran out of steps. Starting over in 61 seconds.");
+        tokio::time::sleep(Duration::from_secs(61)).await;
     }
-    record(&state, &client, &model, &path_query, "503", None, t0);
+    record(
+        &state,
+        RecordArgs {
+            client: &client,
+            virtual_model: &model,
+            actual_model: None,
+            path: &path_query,
+            status: "503",
+            lane: None,
+            started: t0,
+        },
+    );
+    println!("no provider lane available for the requested model");
     let _ = tx.send(sse_error("no_capacity")).await;
 }
 

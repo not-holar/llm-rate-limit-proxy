@@ -411,6 +411,7 @@ pub async fn run() {
         .route("/logout", post(auth::logout))
         .route("/setup", get(setup::setup_page).post(setup::setup_submit))
         .route("/v1/{*path}", any(proxy::handle))
+        // .route("/chat/{*path}", any(proxy::handle))
         .layer(axum::middleware::from_fn(security_headers))
         // Outermost: a refused source should not reach routing, auth, or the
         // rate pool at all.
