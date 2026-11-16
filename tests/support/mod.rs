@@ -62,15 +62,15 @@ impl Server {
             if let Ok(Some(status)) = child.try_wait() {
                 panic!("llm-rate-limit-proxy exited before becoming healthy: {status}");
             }
-            if let Ok(r) = client.get(format!("{base_url}/health")).send().await {
-                if r.status().is_success() {
-                    return Server {
-                        child,
-                        base_url,
-                        client,
-                        _data_dir: data_dir,
-                    };
-                }
+            if let Ok(r) = client.get(format!("{base_url}/health")).send().await
+                && r.status().is_success()
+            {
+                return Server {
+                    child,
+                    base_url,
+                    client,
+                    _data_dir: data_dir,
+                };
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }

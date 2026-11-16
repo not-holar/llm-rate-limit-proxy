@@ -74,10 +74,10 @@ pub fn permitted(rules: &[Rule], peer: IpAddr) -> bool {
     if rules.is_empty() || peer.is_loopback() {
         return true;
     }
-    if let IpAddr::V6(v6) = peer {
-        if v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()) {
-            return true;
-        }
+    if let IpAddr::V6(v6) = peer
+        && v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+    {
+        return true;
     }
     rules.iter().any(|r| matches(r, peer))
 }

@@ -3,8 +3,8 @@
 //! retention window are pruned on each append.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -38,12 +38,12 @@ impl History {
             retention_days as u64 * 86_400
         };
         let mut snapshots = Vec::new();
-        if let Some(p) = &path {
-            if let Ok(content) = std::fs::read_to_string(p) {
-                for line in content.lines() {
-                    if let Ok(s) = serde_json::from_str::<Snapshot>(line) {
-                        snapshots.push(s);
-                    }
+        if let Some(p) = &path
+            && let Ok(content) = std::fs::read_to_string(p)
+        {
+            for line in content.lines() {
+                if let Ok(s) = serde_json::from_str::<Snapshot>(line) {
+                    snapshots.push(s);
                 }
             }
         }

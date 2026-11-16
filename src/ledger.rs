@@ -99,10 +99,10 @@ impl Ledger {
             let base = baseline.get(model).copied().unwrap_or_default();
             live.insert(model.clone(), base.plus(*now));
         }
-        if let Some(p) = &self.path {
-            if let Ok(s) = serde_json::to_string(&*live) {
-                let _ = std::fs::write(p, s);
-            }
+        if let Some(p) = &self.path
+            && let Ok(s) = serde_json::to_string(&*live)
+        {
+            let _ = std::fs::write(p, s);
         }
     }
 
