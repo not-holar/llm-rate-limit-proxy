@@ -120,7 +120,10 @@ fn is_retryable(status: u16) -> bool {
 /// what the caller meant, and being tolerant here costs a user nothing while
 /// saving them an afternoon.
 fn normalize_path(path_query: &str) -> String {
-    format!("/v1{}", path_query.to_string().trim_start_matches("/v1"))
+    format!(
+        "/v1/{}",
+        path_query.trim_prefix("/").trim_start_matches("v1/")
+    )
 }
 
 /// The Anthropic API version to send when a client did not pick one. Pinned
@@ -249,7 +252,7 @@ fn bench_lane(
     let cooldown = cooldown.unwrap_or(DEFAULT_BENCH);
     let pool = state.pool.read().unwrap().clone();
     if let Some(lane) = pool.lanes().get(lane_idx) {
-        lane.bench(Instant::now() + cooldown);
+        lane.bench(model, Instant::now() + cooldown);
         state.metrics.record_event("lane_benched");
         // Retries are invisible in the access log, which only records how a
         // request finally ended. Without this line an operator can see that the
@@ -284,14 +287,23 @@ fn resolve_plan(
     if let Some(name) = model
         && let Some(alias) = aliases.iter().find(|a| a.name == name)
     {
-        return alias
-            .targets
-            .iter()
-            .map(|t| PlanStep {
-                provider: Some(t.provider.clone()),
-                model: Some(t.model.clone()),
-            })
-            .collect();
+        // Group targets by model in order of first appearance
+        let mut models = Vec::new();
+        for t in &alias.targets {
+            if !models.contains(&t.model) {
+                models.push(t.model.clone());
+            }
+        }
+        let mut steps = Vec::new();
+        for m in models {
+            for t in alias.targets.iter().filter(|t| t.model == m) {
+                steps.push(PlanStep {
+                    provider: Some(t.provider.clone()),
+                    model: Some(t.model.clone()),
+                });
+            }
+        }
+        return steps;
     }
     // Try the providers whose catalog actually lists this model first. Sending it
     // to one that doesn't spends a rate slot to earn a 404 and then fails over,
@@ -467,7 +479,9 @@ async fn fetch_catalog(
 ) -> Option<Vec<serde_json::Value>> {
     let permit = with_deadline(
         deadline,
-        state.dispatch.acquire_for(Some(provider), &[], None, None),
+        state
+            .dispatch
+            .acquire_for(Some(provider), &[], None, None, None),
     )
     .await??;
     let rb = state.http.get(format!("{}/v1/models", permit.base_url));
@@ -732,6 +746,7 @@ pub async fn handle(
                     &excluded,
                     session,
                     Some(wire),
+                    Some(step_model),
                 ),
             )
             .await
@@ -792,7 +807,6 @@ pub async fn handle(
             };
             match sent {
                 Ok(resp) => {
-                    dbg!();
                     let status = resp.status().as_u16();
                     let headers = resp.headers().to_owned();
                     let payload = resp.bytes().await.unwrap_or_default();
@@ -1123,10 +1137,11 @@ async fn acquire_for_heartbeating(
     wire: Protocol,
     deadline: Option<Instant>,
     tx: &Tx,
+    model: Option<&str>,
 ) -> Result<Option<Permit>, ()> {
     let acq = state
         .dispatch
-        .acquire_for(provider, excluded, session, Some(wire));
+        .acquire_for(provider, excluded, session, Some(wire), model);
     tokio::pin!(acq);
     loop {
         let beat = tokio::time::sleep(HEARTBEAT);
@@ -1226,6 +1241,7 @@ async fn stream_proxy(
                 wire,
                 deadline,
                 &tx,
+                Some(step_model),
             )
             .await
             {

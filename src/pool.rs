@@ -3,7 +3,7 @@
 //! rolling window, matching a real provider's limiter rather than a burstable
 //! token bucket.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -80,14 +80,14 @@ pub struct Lane {
     pub protocol: Protocol,
     pub no_v1: bool,
     limiter: Mutex<SlidingWindow>,
-    cooldown_until: Mutex<Option<Instant>>,
+    cooldowns: Mutex<HashMap<String, Instant>>,
 }
 
 impl Lane {
     fn new(spec: LaneSpec, window: Duration) -> Self {
         Self {
             limiter: Mutex::new(SlidingWindow::new(spec.rpm, window)),
-            cooldown_until: Mutex::new(None),
+            cooldowns: Mutex::new(HashMap::new()),
             provider: spec.provider,
             base_url: spec.base_url,
             key: spec.key,
@@ -97,29 +97,28 @@ impl Lane {
         }
     }
 
-    /// Take this lane out of rotation until `until`. A key that just answered 429
-    /// or 5xx will answer the same way to the next request, so the rebuff has to
-    /// be remembered by the pool rather than only by the request that found it.
-    pub fn bench(&self, until: Instant) {
-        let mut cooldown = self.cooldown_until.lock().unwrap();
-        // Never shorten a bench already in force: concurrent failures on the same
-        // lane must not let a smaller backoff cancel a larger one.
-        *cooldown = Some(cooldown.map_or(until, |current| current.max(until)));
+    /// Take this lane out of rotation for a specific model until `until`.
+    pub fn bench(&self, model: &str, until: Instant) {
+        let mut cooldowns = self.cooldowns.lock().unwrap();
+        let entry = cooldowns.entry(model.to_string()).or_insert(until);
+        *entry = (*entry).max(until);
     }
 
-    pub fn benched(&self, now: Instant) -> bool {
-        self.cooldown_until
+    pub fn benched(&self, model: &str, now: Instant) -> bool {
+        self.cooldowns
             .lock()
             .unwrap()
-            .is_some_and(|until| until > now)
+            .get(model)
+            .is_some_and(|&until| until > now)
     }
 
-    /// When this lane's cooldown ends, if it is benched right now.
-    pub fn cooldown_ends(&self, now: Instant) -> Option<Instant> {
-        self.cooldown_until
-            .lock()
-            .unwrap()
-            .filter(|&until| until > now)
+    /// When this lane's cooldown for a specific model (or any model if None) ends, if it is benched right now.
+    pub fn cooldown_ends(&self, model: Option<&str>, now: Instant) -> Option<Instant> {
+        let cooldowns = self.cooldowns.lock().unwrap();
+        match model {
+            Some(m) => cooldowns.get(m).filter(|&&until| until > now).copied(),
+            None => cooldowns.values().filter(|&&until| until > now).max().copied(),
+        }
     }
 
     pub fn try_acquire(&self, now: Instant) -> Result<(), Instant> {
@@ -137,7 +136,7 @@ impl Lane {
     fn carry_from(&self, old: &Lane) {
         let hits = old.limiter.lock().unwrap().hits.clone();
         self.limiter.lock().unwrap().hits = hits;
-        *self.cooldown_until.lock().unwrap() = *old.cooldown_until.lock().unwrap();
+        *self.cooldowns.lock().unwrap() = old.cooldowns.lock().unwrap().clone();
     }
 }
 
@@ -415,9 +414,9 @@ mod tests {
         let pool = Pool::new(specs(1));
         let lane = &pool.lanes()[0];
         let now = Instant::now();
-        lane.bench(now + Duration::from_secs(5));
-        assert!(lane.benched(now));
-        assert!(!lane.benched(now + Duration::from_secs(6)));
+        lane.bench("x", now + Duration::from_secs(5));
+        assert!(lane.benched("x", now));
+        assert!(!lane.benched("x", now + Duration::from_secs(6)));
     }
 
     /// Two requests can discover the same sick key at once. The shorter of their
@@ -427,9 +426,9 @@ mod tests {
         let pool = Pool::new(specs(1));
         let lane = &pool.lanes()[0];
         let now = Instant::now();
-        lane.bench(now + Duration::from_secs(30));
-        lane.bench(now + Duration::from_secs(2));
-        assert!(lane.benched(now + Duration::from_secs(10)));
+        lane.bench("x", now + Duration::from_secs(30));
+        lane.bench("x", now + Duration::from_secs(2));
+        assert!(lane.benched("x", now + Duration::from_secs(10)));
     }
 
     /// A settings save must not hand every key a fresh rate window. Without
@@ -462,8 +461,8 @@ mod tests {
     fn a_rebuilt_pool_keeps_a_benched_lane_benched() {
         let pool = Pool::with_window(specs(1), Duration::from_secs(60));
         let now = Instant::now();
-        pool.lanes()[0].bench(now + Duration::from_secs(30));
-        assert!(pool.rebuild(specs(1)).lanes()[0].benched(now));
+        pool.lanes()[0].bench("x", now + Duration::from_secs(30));
+        assert!(pool.rebuild(specs(1)).lanes()[0].benched("x", now));
     }
 
     #[test]
