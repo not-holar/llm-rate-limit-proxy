@@ -120,6 +120,9 @@ fn is_retryable(status: u16) -> bool {
 /// what the caller meant, and being tolerant here costs a user nothing while
 /// saving them an afternoon.
 fn normalize_path(path_query: &str) -> String {
+    if path_query.is_empty() {
+        return "/v1".to_string();
+    }
     format!(
         "/v1/{}",
         path_query.trim_prefix("/").trim_start_matches("v1/")
@@ -131,10 +134,6 @@ fn normalize_path(path_query: &str) -> String {
 /// silently moving it would change what clients receive without them asking.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
-/// Longest we honor a provider's `Retry-After`. Beyond this the value is more
-/// likely wrong than real, and obeying it would park a paid key for no reason.
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
-
 /// How long the provider asked us to stay away, from `Retry-After`. Only the
 /// delta-seconds form is read — RFC 9110 also allows an HTTP-date, which needs a
 /// date parser we don't carry; that form reads as "no guidance" so the caller
@@ -142,7 +141,7 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 fn retry_after(headers: &HeaderMap) -> Option<Duration> {
     let raw = headers.get(header::RETRY_AFTER)?.to_str().ok()?;
     let secs: u64 = raw.trim().parse().ok()?;
-    Some(Duration::from_secs(secs).min(MAX_RETRY_AFTER))
+    Some(Duration::from_secs(secs))
 }
 
 /// Holds one concurrency slot, releasing it on drop so a request frees its slot
@@ -1733,14 +1732,12 @@ mod tests {
         }
 
         #[test]
-        fn retry_after_never_panics_and_is_always_clamped(raw in ".*") {
+        fn retry_after_never_panics(raw in ".*") {
             let mut h = HeaderMap::new();
             if let Ok(v) = HeaderValue::from_str(&raw) {
                 h.insert(header::RETRY_AFTER, v);
             }
-            if let Some(d) = retry_after(&h) {
-                proptest::prop_assert!(d <= MAX_RETRY_AFTER, "unclamped: {:?}", d);
-            }
+            let _ = retry_after(&h);
         }
 
         /// A body is attacker-controlled and arbitrary bytes are not JSON. Every
@@ -1802,11 +1799,10 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_clamps_absurd_backoffs() {
-        // A buggy or hostile upstream must not be able to park a key for a day.
+    fn retry_after_parses_seconds() {
         assert_eq!(
             retry_after(&with_retry_after("86400")),
-            Some(MAX_RETRY_AFTER)
+            Some(Duration::from_secs(86400))
         );
     }
 }

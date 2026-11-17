@@ -117,7 +117,11 @@ impl Lane {
         let cooldowns = self.cooldowns.lock().unwrap();
         match model {
             Some(m) => cooldowns.get(m).filter(|&&until| until > now).copied(),
-            None => cooldowns.values().filter(|&&until| until > now).max().copied(),
+            None => cooldowns
+                .values()
+                .filter(|&&until| until > now)
+                .max()
+                .copied(),
         }
     }
 

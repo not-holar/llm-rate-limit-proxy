@@ -52,8 +52,8 @@ impl Dispatcher {
         protocol: Option<Protocol>,
         model: Option<&str>,
     ) -> Option<Permit> {
-        let _fifo = self.gate.lock().await;
         loop {
+            let _fifo = self.gate.lock().await;
             let pool = self.pool.read().unwrap().clone();
             let now = Instant::now();
             let mut soonest: Option<Instant> = None;
@@ -113,6 +113,7 @@ impl Dispatcher {
                 Some(t) => t.saturating_duration_since(Instant::now()),
                 None => Duration::from_millis(100),
             };
+            drop(_fifo);
             tokio::time::sleep(wait).await;
         }
     }
