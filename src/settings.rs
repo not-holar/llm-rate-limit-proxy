@@ -8,15 +8,15 @@
 
 use std::sync::Arc;
 
+use axum::Extension;
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Extension;
-use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::{auth, config, pool, AppState};
+use crate::{AppState, auth, config, pool};
 
 fn forbidden(message: &str) -> Response {
     (
@@ -26,8 +26,8 @@ fn forbidden(message: &str) -> Response {
         .into_response()
 }
 
-fn is_admin(state: &AppState, username: &str) -> bool {
-    let store = state.store.lock().unwrap();
+async fn is_admin(state: &AppState, username: &str) -> bool {
+    let store = state.store.lock().await;
     store
         .users
         .iter()
@@ -48,17 +48,17 @@ fn bad_request(message: &str) -> Response {
 /// The store lock is released before the pool swap so a save never holds two
 /// locks at once, and the rebuild carries rate state so this is safe to call
 /// while requests are in flight.
-fn apply(state: &Arc<AppState>) -> Result<(), String> {
+async fn apply(state: &Arc<AppState>) -> Result<(), String> {
     let (specs, snapshot) = {
-        let store = state.store.lock().unwrap();
+        let store = state.store.lock().await;
         (pool::lane_specs(&store), store.clone())
     };
     config::save(&state.data_dir, &snapshot)?;
     let rebuilt = {
-        let current = state.pool.read().unwrap().clone();
+        let current = state.pool.read().await;
         current.rebuild(specs)
     };
-    *state.pool.write().unwrap() = Arc::new(rebuilt);
+    *state.pool.write().await = rebuilt;
     Ok(())
 }
 
@@ -72,9 +72,9 @@ pub async fn view(
     State(state): State<Arc<AppState>>,
     Extension(who): Extension<auth::SessionUser>,
 ) -> Json<serde_json::Value> {
-    let admin = is_admin(&state, who.name());
+    let admin = is_admin(&state, who.name()).await;
     let me = who.name().to_string();
-    let store = state.store.lock().unwrap();
+    let store = state.store.lock().await;
     Json(json!({
         "providers": store.providers.iter().map(|p| json!({
             "name": p.name,
@@ -137,7 +137,7 @@ pub async fn provider_keys(
     Json(action): Json<KeyAction>,
 ) -> Response {
     {
-        let mut store = state.store.lock().unwrap();
+        let mut store = state.store.lock().await;
         let name = match &action {
             KeyAction::Add { provider, .. }
             | KeyAction::Remove { provider, .. }
@@ -202,7 +202,7 @@ pub async fn provider_keys(
         }
     }
 
-    finish(&state)
+    finish(&state).await
 }
 
 fn check_rpm(rpm: usize) -> Result<(), String> {
@@ -267,7 +267,7 @@ pub async fn providers(
     Json(action): Json<ProviderAction>,
 ) -> Response {
     {
-        let mut store = state.store.lock().unwrap();
+        let mut store = state.store.lock().await;
         match action {
             ProviderAction::Add {
                 name,
@@ -337,7 +337,7 @@ pub async fn providers(
             return bad_request("that would leave no enabled keys and stop the proxy serving");
         }
     }
-    finish(&state)
+    finish(&state).await
 }
 
 #[derive(Deserialize)]
@@ -360,7 +360,7 @@ pub async fn aliases(
     Json(action): Json<AliasAction>,
 ) -> Response {
     {
-        let mut store = state.store.lock().unwrap();
+        let mut store = state.store.lock().await;
         match action {
             AliasAction::Upsert { name, targets } => {
                 let name = name.trim().to_string();
@@ -391,7 +391,7 @@ pub async fn aliases(
             }
         }
     }
-    finish(&state)
+    finish(&state).await
 }
 
 /// Turn a persistence outcome into a response. A failed save is the one error
@@ -409,8 +409,8 @@ fn saved(result: Result<(), String>) -> Response {
 }
 
 /// Persist and rebuild the pool, mapping the outcome to a response.
-fn finish(state: &Arc<AppState>) -> Response {
-    saved(apply(state))
+async fn finish(state: &Arc<AppState>) -> Response {
+    saved(apply(state).await)
 }
 
 #[derive(Deserialize)]
@@ -430,8 +430,8 @@ pub async fn clients(
     Extension(who): Extension<auth::SessionUser>,
     Json(action): Json<ClientAction>,
 ) -> Response {
-    let admin = is_admin(&state, who.name());
-    let mut store = state.store.lock().unwrap();
+    let admin = is_admin(&state, who.name()).await;
+    let mut store = state.store.lock().await;
     let minted = match action {
         ClientAction::Mint { label } => {
             let label = label.trim().to_string();
@@ -502,7 +502,7 @@ const MIN_PASSWORD: usize = 10;
 /// with no way back in short of editing the store on disk.
 pub async fn users(State(state): State<Arc<AppState>>, Json(action): Json<UserAction>) -> Response {
     let snapshot = {
-        let mut store = state.store.lock().unwrap();
+        let mut store = state.store.lock().await;
         match action {
             UserAction::Add {
                 username,
@@ -575,7 +575,7 @@ pub struct LimitsReq {
 /// two of the three.
 pub async fn limits(State(state): State<Arc<AppState>>, Json(req): Json<LimitsReq>) -> Response {
     let snapshot = {
-        let mut store = state.store.lock().unwrap();
+        let mut store = state.store.lock().await;
         if let Some(v) = req.max_inflight {
             if v == 0 {
                 return bad_request("max_inflight must be at least 1");

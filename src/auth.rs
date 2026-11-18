@@ -2,25 +2,26 @@
 //! tokens, client API keys, the `require_session` guard, and login/logout. Kept in
 //! one place so the security posture is auditable from a single file.
 
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
+use axum::Form;
 use axum::extract::State;
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::Form;
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2_hmac;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use crate::config::ClientKey;
 use crate::AppState;
+use crate::config::ClientKey;
 
 const PBKDF2_ROUNDS: u32 = 600_000;
 
@@ -179,13 +180,13 @@ impl Admin {
     }
 
     /// True while the failure window is saturated — reject new attempts.
-    pub fn is_throttled(&self) -> bool {
-        let t = self.throttle.lock().unwrap();
+    pub async fn is_throttled(&self) -> bool {
+        let t = self.throttle.lock().await;
         t.fails >= MAX_LOGIN_FAILS && t.window_start.elapsed() < LOGIN_WINDOW
     }
 
-    fn record_login_failure(&self) {
-        let mut t = self.throttle.lock().unwrap();
+    async fn record_login_failure(&self) {
+        let mut t = self.throttle.lock().await;
         if t.window_start.elapsed() >= LOGIN_WINDOW {
             t.fails = 0;
             t.window_start = Instant::now();
@@ -193,8 +194,8 @@ impl Admin {
         t.fails += 1;
     }
 
-    fn reset_login_failures(&self) {
-        self.throttle.lock().unwrap().fails = 0;
+    async fn reset_login_failures(&self) {
+        self.throttle.lock().await.fails = 0;
     }
 }
 
@@ -244,7 +245,7 @@ pub async fn require_session(
         .filter(|(username, witness)| {
             // The account must still exist and still have the password this
             // session was issued against. A reset or a deletion ends it here.
-            let store = state.store.lock().unwrap();
+            let store = state.store.try_lock().unwrap();
             store
                 .users
                 .iter()
@@ -294,7 +295,7 @@ pub async fn require_session_or_basic(
         session_from_cookies(headers.get(header::COOKIE).and_then(|v| v.to_str().ok()))
             .and_then(|t| state.admin.verify(&t))
             .is_some_and(|(username, witness)| {
-                let store = state.store.lock().unwrap();
+                let store = state.store.try_lock().unwrap();
                 store
                     .users
                     .iter()
@@ -315,7 +316,7 @@ pub async fn require_session_or_basic(
         .and_then(|raw| String::from_utf8(raw).ok())
         .and_then(|pair| {
             let (user, pass) = pair.split_once(':')?;
-            let store = state.store.lock().unwrap();
+            let store = state.store.try_lock().unwrap();
             let ok = store
                 .users
                 .iter()
@@ -353,7 +354,7 @@ pub async fn require_admin(
         .extensions()
         .get::<SessionUser>()
         .and_then(|u| {
-            let store = state.store.lock().unwrap();
+            let store = state.store.try_lock().unwrap();
             store
                 .users
                 .iter()
@@ -402,7 +403,7 @@ pub async fn login_submit(
     State(state): State<Arc<AppState>>,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    if state.admin.is_throttled() {
+    if state.admin.is_throttled().await {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             "too many attempts, try again shortly",
@@ -412,7 +413,7 @@ pub async fn login_submit(
     // Capture the witness of the hash we authenticated against, so the session
     // is tied to this exact password and not merely to the username.
     let (ok, witness) = {
-        let store = state.store.lock().unwrap();
+        let store = state.store.lock().await;
         match store.users.iter().find(|u| u.username == form.username) {
             Some(u) if verify_password(&form.password, &u.pw_hash) => {
                 (true, Admin::pw_witness(&u.pw_hash))
@@ -624,16 +625,16 @@ mod tests {
         assert!(session_from_cookies(None).is_none());
     }
 
-    #[test]
-    fn throttle_trips_after_max_fails() {
+    #[tokio::test]
+    async fn throttle_trips_after_max_fails() {
         let a = Admin::new(false);
         for _ in 0..MAX_LOGIN_FAILS {
-            assert!(!a.is_throttled());
+            assert!(!a.is_throttled().await);
             a.record_login_failure();
         }
-        assert!(a.is_throttled());
+        assert!(a.is_throttled().await);
         a.reset_login_failures();
-        assert!(!a.is_throttled());
+        assert!(!a.is_throttled().await);
     }
 
     #[test]

@@ -3,8 +3,8 @@
 //! retention window are pruned on each append.
 
 use std::path::PathBuf;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -67,8 +67,8 @@ impl History {
 
     /// Append a snapshot, prune expired ones, and persist. Retention keeps the file
     /// small (≈8.6k lines at 30 days × 5-min), so a full rewrite each tick is cheap.
-    pub fn append(&self, t: u64, total: u64) {
-        let mut snaps = self.snapshots.write().unwrap();
+    pub async fn append(&self, t: u64, total: u64) {
+        let mut snaps = self.snapshots.write().await;
         snaps.push(Snapshot { t, total });
         let cutoff = t.saturating_sub(self.retention_secs.load(Ordering::Relaxed));
         snaps.retain(|s| s.t >= cutoff);
@@ -85,8 +85,8 @@ impl History {
     }
 
     /// Snapshots within `[from, to]`, downsampled to at most `max` points.
-    pub fn range(&self, from: u64, to: u64, max: usize) -> Vec<Snapshot> {
-        let snaps = self.snapshots.read().unwrap();
+    pub async fn range(&self, from: u64, to: u64, max: usize) -> Vec<Snapshot> {
+        let snaps = self.snapshots.read().await;
         let filtered: Vec<Snapshot> = snaps
             .iter()
             .copied()
@@ -108,62 +108,62 @@ fn downsample(v: Vec<Snapshot>, max: usize) -> Vec<Snapshot> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn append_range_roundtrips() {
+    #[tokio::test]
+    async fn append_range_roundtrips() {
         let h = History::load(None, 30);
-        h.append(100, 5);
-        h.append(200, 9);
-        let all = h.range(0, 1000, 100);
+        h.append(100, 5).await;
+        h.append(200, 9).await;
+        let all = h.range(0, 1000, 100).await;
         assert_eq!(all.len(), 2);
         assert_eq!(all[1].total, 9);
         // Range filtering.
-        assert_eq!(h.range(150, 1000, 100).len(), 1);
+        assert_eq!(h.range(150, 1000, 100).await.len(), 1);
     }
 
     /// Retention is offered as a live setting, so it has to behave like one.
-    #[test]
-    fn shortening_retention_prunes_on_the_next_append() {
+    #[tokio::test]
+    async fn shortening_retention_prunes_on_the_next_append() {
         let h = History::load(None, 0); // keep forever
-        h.append(1_000, 1);
-        h.append(200_000, 2);
-        assert_eq!(h.range(0, u64::MAX, 100).len(), 2);
+        h.append(1_000, 1).await;
+        h.append(200_000, 2).await;
+        assert_eq!(h.range(0, u64::MAX, 100).await.len(), 2);
 
         h.set_retention_days(1); // 86400s
-        h.append(200_001, 3);
-        let kept = h.range(0, u64::MAX, 100);
+        h.append(200_001, 3).await;
+        let kept = h.range(0, u64::MAX, 100).await;
         assert_eq!(kept.len(), 2, "the 1_000s snapshot is now out of window");
         assert_eq!(kept[0].t, 200_000);
     }
 
-    #[test]
-    fn prunes_beyond_retention() {
+    #[tokio::test]
+    async fn prunes_beyond_retention() {
         let h = History::load(None, 1); // 1 day = 86400s
-        h.append(1_000, 1);
-        h.append(1_000 + 200_000, 2); // 200k s later — first is now expired
-        let all = h.range(0, u64::MAX, 100);
+        h.append(1_000, 1).await;
+        h.append(1_000 + 200_000, 2).await; // 200k s later — first is now expired
+        let all = h.range(0, u64::MAX, 100).await;
         assert_eq!(all.len(), 1, "old snapshot should have been pruned");
         assert_eq!(all[0].total, 2);
     }
 
-    #[test]
-    fn persists_and_reloads() {
+    #[tokio::test]
+    async fn persists_and_reloads() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.jsonl");
         {
             let h = History::load(Some(path.clone()), 30);
-            h.append(10, 1);
-            h.append(20, 4);
+            h.append(10, 1).await;
+            h.append(20, 4).await;
         }
         let reloaded = History::load(Some(path), 30);
-        assert_eq!(reloaded.range(0, 1000, 100).len(), 2);
+        assert_eq!(reloaded.range(0, 1000, 100).await.len(), 2);
     }
 
-    #[test]
-    fn downsamples_to_max() {
+    #[tokio::test]
+    async fn downsamples_to_max() {
         let h = History::load(None, 0);
         for i in 0..1000 {
-            h.append(i, i);
+            h.append(i, i).await;
         }
-        assert!(h.range(0, u64::MAX, 50).len() <= 50);
+        assert!(h.range(0, u64::MAX, 50).await.len() <= 50);
     }
 }

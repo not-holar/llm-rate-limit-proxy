@@ -54,7 +54,7 @@ impl Dispatcher {
     ) -> Option<Permit> {
         loop {
             let _fifo = self.gate.lock().await;
-            let pool = self.pool.read().unwrap().clone();
+            let pool = self.pool.read().await;
             let now = Instant::now();
             let mut soonest: Option<Instant> = None;
             let mut eligible = false;
@@ -123,7 +123,8 @@ impl Dispatcher {
 mod tests {
     use super::*;
     use crate::pool::{LaneSpec, Pool};
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
 
     fn spec(name: &str, rpm: usize) -> LaneSpec {
         LaneSpec {
@@ -137,7 +138,7 @@ mod tests {
     }
 
     fn handle(pool: Pool) -> PoolHandle {
-        Arc::new(RwLock::new(Arc::new(pool)))
+        Arc::new(RwLock::new(pool))
     }
 
     #[tokio::test]

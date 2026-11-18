@@ -120,9 +120,10 @@ fn is_retryable(status: u16) -> bool {
 /// what the caller meant, and being tolerant here costs a user nothing while
 /// saving them an afternoon.
 fn normalize_path(path_query: &str) -> String {
-    if path_query.is_empty() {
+    if path_query == "/v1" {
         return "/v1".to_string();
     }
+
     format!(
         "/v1/{}",
         path_query.trim_prefix("/").trim_start_matches("v1/")
@@ -139,7 +140,7 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// date parser we don't carry; that form reads as "no guidance" so the caller
 /// falls back to its own backoff instead of guessing at zero.
 fn retry_after(headers: &HeaderMap) -> Option<Duration> {
-    let raw = headers.get(header::RETRY_AFTER)?.to_str().ok()?;
+    let raw = dbg!(headers.get(header::RETRY_AFTER)?.to_str().ok()?);
     let secs: u64 = raw.trim().parse().ok()?;
     Some(Duration::from_secs(secs))
 }
@@ -184,7 +185,7 @@ async fn admit_model(
     mut beat: impl FnMut() -> bool,
 ) -> Option<governor::ModelPermit> {
     loop {
-        if let Some(permit) = governor::admit(&state.governor, model, Instant::now()) {
+        if let Some(permit) = governor::admit(&state.governor, model, Instant::now()).await {
             return Some(permit);
         }
         if deadline.is_some_and(|d| Instant::now() + GOVERNOR_POLL >= d) {
@@ -241,7 +242,7 @@ const DEFAULT_BENCH: Duration = Duration::from_secs(61);
 /// Take the rebuffed lane out of rotation for as long as the provider asked, or
 /// a short default. A key that just answered 429 will answer the same way to the
 /// next request, so without this every request pays to rediscover it.
-fn bench_lane(
+async fn bench_lane(
     state: &AppState,
     lane_idx: usize,
     model: &str,
@@ -249,7 +250,7 @@ fn bench_lane(
     cooldown: Option<Duration>,
 ) {
     let cooldown = cooldown.unwrap_or(DEFAULT_BENCH);
-    let pool = state.pool.read().unwrap().clone();
+    let pool = state.pool.read().await;
     if let Some(lane) = pool.lanes().get(lane_idx) {
         lane.bench(model, Instant::now() + cooldown);
         state.metrics.record_event("lane_benched");
@@ -440,7 +441,7 @@ async fn serve_catalog(
     deadline: Option<Instant>,
 ) -> Response {
     let providers: Vec<String> = {
-        let store = state.store.lock().unwrap();
+        let store = state.store.lock().await;
         store.providers.iter().map(|p| p.name.clone()).collect()
     };
 
@@ -483,7 +484,11 @@ async fn fetch_catalog(
             .acquire_for(Some(provider), &[], None, None, None),
     )
     .await??;
-    let rb = state.http.get(format!("{}/v1/models", permit.base_url));
+    let rb = state.http.get(format!(
+        "{}{}/models",
+        permit.base_url,
+        if permit.no_v1 { "" } else { "/v1" }
+    ));
     let rb = match permit.protocol {
         Protocol::OpenAi => rb.header("authorization", format!("Bearer {}", permit.key)),
         Protocol::Anthropic => rb
@@ -523,7 +528,7 @@ pub async fn handle(
 
     // Keyed auth: a valid client key must be presented. Its label is the metrics
     // dimension for "who" — trusted (admin-set), never the secret.
-    let clients = { state.store.lock().unwrap().clients.clone() };
+    let clients = { state.store.lock().await.clients.clone() };
     // Anthropic-native clients send `x-api-key`; the OpenAI world sends
     // `Authorization: Bearer`. Accept either, so a client authenticates the way
     // its own protocol says to rather than the way this proxy would prefer.
@@ -542,7 +547,7 @@ pub async fn handle(
         );
     };
 
-    if state.pool.read().unwrap().is_empty() {
+    if state.pool.read().await.is_empty() {
         return err(
             StatusCode::SERVICE_UNAVAILABLE,
             "no_capacity",
@@ -553,7 +558,7 @@ pub async fn handle(
     // Shed before parsing: an agent transcript is a large body and the paths below
     // walk it more than once, so a flood must be turned away before that cost is
     // paid. The guard rides the whole request and frees its slot on drop.
-    let max_inflight = { state.store.lock().unwrap().settings.max_inflight };
+    let max_inflight = { state.store.lock().await.settings.max_inflight };
     let Some(inflight) = try_admit(&state.inflight, max_inflight) else {
         state.metrics.record_event("shed");
         return overloaded();
@@ -577,7 +582,7 @@ pub async fn handle(
                 .map(|v| (n.as_str().to_string(), v.to_string()))
         })
         .collect();
-    let aliases = { state.store.lock().unwrap().aliases.clone() };
+    let aliases = { state.store.lock().await.aliases.clone() };
 
     // Catalog requests are answered locally rather than forwarded. Forwarding
     // would spend rate budget on a poll, return whichever provider won the lane,
@@ -639,7 +644,13 @@ pub async fn handle(
     // untouched, which is what a passthrough proxy should do anyway.
     let parsed: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
     let requested = parsed.as_ref().and_then(requested_model);
-    let model_label = requested.clone().unwrap_or_else(|| "unknown".to_string());
+    let Some(model_label) = requested.clone() else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "no_model_requested",
+            "the request didn't provide a model",
+        );
+    };
     let session = parsed.as_ref().and_then(session_key);
 
     // What the harness asked for, in counts and sizes only. Conversation depth
@@ -676,7 +687,7 @@ pub async fn handle(
         // fields — so adding `stream_options` there turns a good request into a
         // 400.
         let injected = (wire == Protocol::OpenAi
-            && !state.no_inject.lock().unwrap().contains(&model_label))
+            && !state.no_inject.lock().await.contains(&model_label))
         .then(|| parsed.as_ref().and_then(inject_usage))
         .flatten();
         let (out_body, fallback) = match injected {
@@ -1195,7 +1206,7 @@ async fn stream_proxy(
     if tx.send(heartbeat_frame()).await.is_err() {
         return;
     }
-    let pool_len = state.pool.read().unwrap().len();
+    let pool_len = state.pool.read().await.len();
     let offering = state.catalog.providers_offering(&model);
     let plan = resolve_plan(requested.as_deref(), &aliases, pool_len, &offering);
     let last = plan.len().saturating_sub(1);
@@ -1338,7 +1349,7 @@ async fn stream_proxy(
                     // on the 400 alone would blame our injection for a body the client
                     // simply got wrong, and permanently give up exact token counts.
                     if retried_plain && resp.status().is_success() {
-                        state.no_inject.lock().unwrap().insert(model.clone());
+                        state.no_inject.lock().await.insert(model.clone());
                     }
                     record(
                         &state,
@@ -1518,8 +1529,8 @@ mod tests {
     /// metrics. Verified here rather than against a provider, because the
     /// provider being unavailable is exactly when these numbers matter and
     /// exactly when a live check cannot run.
-    #[test]
-    fn harvest_reads_usage_finish_reason_and_tool_calls() {
+    #[tokio::test]
+    async fn harvest_reads_usage_finish_reason_and_tool_calls() {
         let metrics = crate::metrics::Metrics::default();
         let body = serde_json::json!({
             "choices": [{
@@ -1536,7 +1547,7 @@ mod tests {
         harvest(&metrics, "m", 5000, &body);
         metrics.record_request("c", "m", "200");
 
-        let stats = metrics.stats();
+        let stats = metrics.stats().await;
         let m = &stats.models[0];
         assert_eq!(m.completion_tokens, 250, "tokens");
         assert_eq!(m.avg_tokens_per_sec, 50, "speed");

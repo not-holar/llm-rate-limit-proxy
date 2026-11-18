@@ -104,7 +104,7 @@ impl Lane {
         *entry = (*entry).max(until);
     }
 
-    pub fn benched(&self, model: &str, now: Instant) -> bool {
+    pub fn is_benched(&self, model: &str, now: Instant) -> bool {
         self.cooldowns
             .lock()
             .unwrap()
@@ -286,7 +286,7 @@ impl Pool {
 }
 
 /// A hot-swappable pool handle: settings can replace the pool without a restart.
-pub type PoolHandle = std::sync::Arc<std::sync::RwLock<std::sync::Arc<Pool>>>;
+pub type PoolHandle = std::sync::Arc<tokio::sync::RwLock<Pool>>;
 
 #[cfg(test)]
 mod tests {
@@ -419,8 +419,8 @@ mod tests {
         let lane = &pool.lanes()[0];
         let now = Instant::now();
         lane.bench("x", now + Duration::from_secs(5));
-        assert!(lane.benched("x", now));
-        assert!(!lane.benched("x", now + Duration::from_secs(6)));
+        assert!(lane.is_benched("x", now));
+        assert!(!lane.is_benched("x", now + Duration::from_secs(6)));
     }
 
     /// Two requests can discover the same sick key at once. The shorter of their
@@ -432,7 +432,7 @@ mod tests {
         let now = Instant::now();
         lane.bench("x", now + Duration::from_secs(30));
         lane.bench("x", now + Duration::from_secs(2));
-        assert!(lane.benched("x", now + Duration::from_secs(10)));
+        assert!(lane.is_benched("x", now + Duration::from_secs(10)));
     }
 
     /// A settings save must not hand every key a fresh rate window. Without
@@ -466,7 +466,7 @@ mod tests {
         let pool = Pool::with_window(specs(1), Duration::from_secs(60));
         let now = Instant::now();
         pool.lanes()[0].bench("x", now + Duration::from_secs(30));
-        assert!(pool.rebuild(specs(1)).lanes()[0].benched("x", now));
+        assert!(pool.rebuild(specs(1)).lanes()[0].is_benched("x", now));
     }
 
     #[test]

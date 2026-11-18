@@ -15,8 +15,9 @@
 //! wording changes and works across providers that phrase it differently.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 /// Rebuffs older than this are no longer evidence of anything current.
 const EVIDENCE_WINDOW: Duration = Duration::from_secs(10);
@@ -103,8 +104,8 @@ impl Governor {
     /// half the concurrency we were actually running. Halving is deliberate: the
     /// true ceiling is unknown and shared with other tenants, so the useful move
     /// is to back off decisively and climb back, not to guess a number.
-    pub fn note_rebuff(&self, model: &str, lane: usize, now: Instant) {
-        let mut models = self.models.lock().unwrap();
+    pub async fn note_rebuff(&self, model: &str, lane: usize, now: Instant) {
+        let mut models = self.models.lock().await;
         let state = models.entry(model.to_string()).or_default();
         state.prune(now);
         state.rebuffs.push((now, lane));
@@ -149,8 +150,8 @@ impl Governor {
 
     /// Current concurrency cap for `model`; 0 means ungoverned. A model that has
     /// been quiet for `DISSOLVE_AFTER` releases its cap here.
-    pub fn limit(&self, model: &str, now: Instant) -> usize {
-        let mut models = self.models.lock().unwrap();
+    pub async fn limit(&self, model: &str, now: Instant) -> usize {
+        let mut models = self.models.lock().await;
         let Some(state) = models.get_mut(model) else {
             return 0;
         };
@@ -183,8 +184,8 @@ impl Governor {
     /// idle". A request gated here never reaches the rate limiter, so rate-based
     /// capacity reads 0% while everything stalls; without this the blocking
     /// constraint is invisible.
-    pub fn pressured(&self, now: Instant) -> Vec<ModelPressure> {
-        let mut models = self.models.lock().unwrap();
+    pub async fn pressured(&self, now: Instant) -> Vec<ModelPressure> {
+        let mut models = self.models.lock().await;
         let mut out: Vec<ModelPressure> = models
             .iter_mut()
             .filter_map(|(model, state)| {
@@ -208,10 +209,10 @@ impl Governor {
     }
 
     /// Requests in flight on `model` right now.
-    pub fn inflight(&self, model: &str) -> usize {
+    pub async fn inflight(&self, model: &str) -> usize {
         self.models
             .lock()
-            .unwrap()
+            .await
             .get(model)
             .map_or(0, |s| s.inflight)
     }
@@ -219,9 +220,9 @@ impl Governor {
 
 /// Claim a concurrency slot on `model`, or `None` when it is at its cap.
 /// Ungoverned models always admit. The permit releases on drop.
-pub fn admit(gov: &Arc<Governor>, model: &str, now: Instant) -> Option<ModelPermit> {
-    let limit = gov.limit(model, now);
-    let mut models = gov.models.lock().unwrap();
+pub async fn admit(gov: &Arc<Governor>, model: &str, now: Instant) -> Option<ModelPermit> {
+    let limit = gov.limit(model, now).await;
+    let mut models = gov.models.lock().await;
     let state = models.entry(model.to_string()).or_default();
     if limit > 0 && state.inflight >= limit {
         return None;
@@ -242,7 +243,13 @@ pub struct ModelPermit {
 
 impl Drop for ModelPermit {
     fn drop(&mut self) {
-        if let Some(state) = self.governor.models.lock().unwrap().get_mut(&self.model) {
+        if let Some(state) = self
+            .governor
+            .models
+            .try_lock()
+            .unwrap()
+            .get_mut(&self.model)
+        {
             state.inflight = state.inflight.saturating_sub(1);
         }
     }
@@ -256,41 +263,44 @@ mod tests {
         Arc::new(Governor::default())
     }
 
-    #[test]
-    fn a_model_starts_ungoverned() {
+    #[tokio::test]
+    async fn a_model_starts_ungoverned() {
         let g = governor();
-        assert_eq!(g.limit("m", Instant::now()), 0);
+        assert_eq!(g.limit("m", Instant::now()).await, 0);
     }
 
     /// The discriminator that makes string matching unnecessary: one key being
     /// rebuffed over and over is a lane problem, and benching that lane is the
     /// right answer. Governing the model here would throttle every healthy key
     /// because one key is sick.
-    #[test]
-    fn repeated_rebuffs_on_one_key_do_not_indict_the_model() {
+    #[tokio::test]
+    async fn repeated_rebuffs_on_one_key_do_not_indict_the_model() {
         let g = governor();
         let now = Instant::now();
         for _ in 0..10 {
             g.note_rebuff("m", 0, now);
         }
-        assert_eq!(g.limit("m", now), 0);
+        assert_eq!(g.limit("m", now).await, 0);
     }
 
     /// Independent per-key limiters do not fail together by chance, so the same
     /// model being rebuffed on two different keys within seconds is evidence the
     /// constraint is the model — no knowledge of the error wording required.
-    #[test]
-    fn rebuffs_across_distinct_keys_indict_the_model() {
+    #[tokio::test]
+    async fn rebuffs_across_distinct_keys_indict_the_model() {
         let g = governor();
         let now = Instant::now();
         g.note_rebuff("m", 0, now);
-        assert_eq!(g.limit("m", now), 0, "one key is not yet evidence");
+        assert_eq!(g.limit("m", now).await, 0, "one key is not yet evidence");
         g.note_rebuff("m", 1, now);
-        assert!(g.limit("m", now) > 0, "two distinct keys indicts the model");
+        assert!(
+            g.limit("m", now).await > 0,
+            "two distinct keys indicts the model"
+        );
     }
 
-    #[test]
-    fn evidence_older_than_the_window_is_not_counted() {
+    #[tokio::test]
+    async fn evidence_older_than_the_window_is_not_counted() {
         let g = governor();
         let start = Instant::now();
         g.note_rebuff("m", 0, start);
@@ -298,65 +308,78 @@ mod tests {
         // two never coexist as evidence and the model stays ungoverned.
         let later = start + EVIDENCE_WINDOW + Duration::from_secs(1);
         g.note_rebuff("m", 1, later);
-        assert_eq!(g.limit("m", later), 0);
+        assert_eq!(g.limit("m", later).await, 0);
     }
 
-    #[test]
-    fn one_models_pressure_does_not_govern_another() {
+    #[tokio::test]
+    async fn one_models_pressure_does_not_govern_another() {
         let g = governor();
         let now = Instant::now();
         g.note_rebuff("busy", 0, now);
         g.note_rebuff("busy", 1, now);
-        assert!(g.limit("busy", now) > 0);
-        assert_eq!(g.limit("quiet", now), 0, "pressure is per model");
+        assert!(g.limit("busy", now).await > 0);
+        assert_eq!(g.limit("quiet", now).await, 0, "pressure is per model");
     }
 
-    #[test]
-    fn a_governed_model_admits_up_to_its_cap_then_refuses() {
+    #[tokio::test]
+    async fn a_governed_model_admits_up_to_its_cap_then_refuses() {
         let g = governor();
         let now = Instant::now();
         // Four in flight when the pressure shows up, so the cap lands at two.
-        let held: Vec<_> = (0..4).map(|_| admit(&g, "m", now).unwrap()).collect();
+        let held: Vec<_> = (0..4).map(async |_| admit(&g, "m", now).await).collect();
         g.note_rebuff("m", 0, now);
         g.note_rebuff("m", 1, now);
-        assert_eq!(g.limit("m", now), 2);
+        assert_eq!(g.limit("m", now).await, 2);
         drop(held);
 
-        let _a = admit(&g, "m", now).expect("first fits under the cap");
-        let _b = admit(&g, "m", now).expect("second fits under the cap");
-        assert!(admit(&g, "m", now).is_none(), "third exceeds the cap");
+        let _a = admit(&g, "m", now).await.expect("first fits under the cap");
+        let _b = admit(&g, "m", now)
+            .await
+            .expect("second fits under the cap");
+        assert!(admit(&g, "m", now).await.is_none(), "third exceeds the cap");
     }
 
-    #[test]
-    fn a_permit_frees_its_slot_on_drop() {
+    #[tokio::test]
+    async fn a_permit_frees_its_slot_on_drop() {
         let g = governor();
         let now = Instant::now();
-        let held: Vec<_> = (0..2).map(|_| admit(&g, "m", now).unwrap()).collect();
-        g.note_rebuff("m", 0, now);
-        g.note_rebuff("m", 1, now);
+        let held: Vec<_> = (0..2).map(async |_| admit(&g, "m", now).await).collect();
+        g.note_rebuff("m", 0, now).await;
+        g.note_rebuff("m", 1, now).await;
         drop(held);
-        assert_eq!(g.inflight("m"), 0);
-        assert!(admit(&g, "m", now).is_some(), "freed slots are reusable");
+        assert_eq!(g.inflight("m").await, 0);
+        assert!(
+            admit(&g, "m", now).await.is_some(),
+            "freed slots are reusable"
+        );
     }
 
-    #[test]
-    fn an_ungoverned_model_admits_without_limit() {
+    #[tokio::test]
+    async fn an_ungoverned_model_admits_without_limit() {
+        use tokio_stream::StreamExt;
+
         let g = governor();
         let now = Instant::now();
-        let held: Vec<_> = (0..64).map(|_| admit(&g, "m", now)).collect();
-        assert!(held.iter().all(|p| p.is_some()));
+        let held: Vec<_> = tokio_stream::iter(0..64)
+            .then(|_| admit(&g, "m", now))
+            .collect()
+            .await;
+        assert!(held.iter().all(|p: &Option<ModelPermit>| p.is_some()));
     }
 
-    #[test]
-    fn pressured_reports_only_governed_models() {
+    #[tokio::test]
+    async fn pressured_reports_only_governed_models() {
         let g = governor();
         let now = Instant::now();
-        let _quiet = admit(&g, "quiet", now).unwrap();
-        assert!(g.pressured(now).is_empty(), "nothing is under pressure yet");
+        let _quiet = admit(&g, "quiet", now).await;
+        assert!(
+            g.pressured(now).await.is_empty(),
+            "nothing is under pressure yet"
+        );
 
-        g.note_rebuff("busy", 0, now);
-        g.note_rebuff("busy", 1, now);
-        let reported = g.pressured(now);
+        g.note_rebuff("busy", 0, now).await;
+        g.note_rebuff("busy", 1, now).await;
+        let reported = g.pressured(now).await;
         assert_eq!(reported.len(), 1, "only the governed model is reported");
         assert_eq!(reported[0].model, "busy");
         assert!(reported[0].limit > 0);
@@ -367,16 +390,21 @@ mod tests {
     /// 6 → 5 → 4 → 3 → 1 concurrent in seconds. Each cut shrinks in-flight,
     /// which shrinks the next cut — a spiral to 1 that no amount of provider
     /// capacity can escape.
-    #[test]
-    fn a_burst_of_rebuffs_from_one_episode_cuts_only_once() {
+    #[tokio::test]
+    async fn a_burst_of_rebuffs_from_one_episode_cuts_only_once() {
+        use tokio_stream::StreamExt;
+
         let g = governor();
         let now = Instant::now();
-        let _held: Vec<_> = (0..8).map(|_| admit(&g, "m", now).unwrap()).collect();
+        let _held: Vec<_> = tokio_stream::iter(0..8)
+            .map(|_| admit(&g, "m", now))
+            .collect()
+            .await;
         for lane in 0..8 {
             g.note_rebuff("m", lane, now);
         }
         assert_eq!(
-            g.limit("m", now),
+            g.limit("m", now).await,
             4,
             "eight rebuffs from one episode must halve once, not eight times"
         );
@@ -390,90 +418,109 @@ mod tests {
     /// the cap is too generous — our gate was not the constraint. The provider's
     /// pool is shared, so that pressure is somebody else's load, and cutting for
     /// it means one busy neighbour can ratchet us to a standstill.
-    #[test]
-    fn pressure_below_the_cap_does_not_cut_further() {
+    #[tokio::test]
+    async fn pressure_below_the_cap_does_not_cut_further() {
+        use tokio_stream::StreamExt;
+
         let g = governor();
         let start = Instant::now();
-        let held: Vec<_> = (0..8).map(|_| admit(&g, "m", start).unwrap()).collect();
+        let held: Vec<_> = tokio_stream::iter(0..8)
+            .then(|_| admit(&g, "m", start))
+            .collect()
+            .await;
         g.note_rebuff("m", 0, start);
         g.note_rebuff("m", 1, start);
         assert_eq!(
-            g.limit("m", start),
+            g.limit("m", start).await,
             4,
             "first cut halves observed concurrency"
         );
         drop(held);
 
         // Now only two requests are in flight — well under the cap of 4.
-        let _two: Vec<_> = (0..2).map(|_| admit(&g, "m", start).unwrap()).collect();
+        let _two: Vec<_> = tokio_stream::iter(0..2)
+            .then(|_| admit(&g, "m", start))
+            .collect()
+            .await;
         let later = start + ADJUST_COOLDOWN + Duration::from_secs(1);
-        g.note_rebuff("m", 2, later);
-        g.note_rebuff("m", 3, later);
+        g.note_rebuff("m", 2, later).await;
+        g.note_rebuff("m", 3, later).await;
         assert_eq!(
-            g.limit("m", later),
+            g.limit("m", later).await,
             4,
             "our gate was not the constraint, so the cap must hold"
         );
     }
 
-    #[test]
-    fn a_cap_never_falls_below_the_floor() {
+    #[tokio::test]
+    async fn a_cap_never_falls_below_the_floor() {
+        use tokio_stream::StreamExt;
+
         let g = governor();
         let mut now = Instant::now();
         // Drive it as hard as possible: always rebuff at exactly the cap.
         for round in 0..12 {
-            let limit = g.limit("m", now).max(1);
-            let held: Vec<_> = (0..limit).filter_map(|_| admit(&g, "m", now)).collect();
+            let limit = g.limit("m", now).await.max(1);
+            let held: Vec<_> = tokio_stream::iter(0..limit)
+                .then(async |_| admit(&g, "m", now).await)
+                .filter(|x| x.is_some())
+                .collect()
+                .await;
             g.note_rebuff("m", round * 2, now);
             g.note_rebuff("m", round * 2 + 1, now);
             drop(held);
             now += ADJUST_COOLDOWN + Duration::from_secs(1);
         }
         assert!(
-            g.limit("m", now) >= MIN_LIMIT,
+            g.limit("m", now).await >= MIN_LIMIT,
             "collapsed to {}",
-            g.limit("m", now)
+            g.limit("m", now).await
         );
     }
 
-    #[test]
-    fn a_stable_model_climbs_back_one_permit_at_a_time() {
+    #[tokio::test]
+    async fn a_stable_model_climbs_back_one_permit_at_a_time() {
+        use tokio_stream::StreamExt;
+
         let g = governor();
         let start = Instant::now();
-        let held: Vec<_> = (0..8).map(|_| admit(&g, "m", start).unwrap()).collect();
-        g.note_rebuff("m", 0, start);
-        g.note_rebuff("m", 1, start);
+        let held: Vec<_> = tokio_stream::iter(0..8)
+            .then(|_| admit(&g, "m", start))
+            .collect()
+            .await;
+        g.note_rebuff("m", 0, start).await;
+        g.note_rebuff("m", 1, start).await;
         drop(held);
-        assert_eq!(g.limit("m", start), 4);
+        assert_eq!(g.limit("m", start).await, 4);
 
         let after_one = start + GROW_INTERVAL + Duration::from_secs(1);
         assert_eq!(
-            g.limit("m", after_one),
+            g.limit("m", after_one).await,
             5,
             "one stable interval, one permit"
         );
         let after_two = after_one + GROW_INTERVAL + Duration::from_secs(1);
-        assert_eq!(g.limit("m", after_two), 6);
+        assert_eq!(g.limit("m", after_two).await, 6);
     }
 
-    #[test]
-    fn growth_does_not_resurrect_an_ungoverned_model() {
+    #[tokio::test]
+    async fn growth_does_not_resurrect_an_ungoverned_model() {
         let g = governor();
         let now = Instant::now();
         let much_later = now + GROW_INTERVAL * 10;
-        assert_eq!(g.limit("never-seen", much_later), 0);
+        assert_eq!(g.limit("never-seen", much_later).await, 0);
     }
 
-    #[test]
-    fn a_quiet_model_returns_to_ungoverned() {
+    #[tokio::test]
+    async fn a_quiet_model_returns_to_ungoverned() {
         let g = governor();
         let start = Instant::now();
-        g.note_rebuff("m", 0, start);
-        g.note_rebuff("m", 1, start);
-        assert!(g.limit("m", start) > 0);
+        g.note_rebuff("m", 0, start).await;
+        g.note_rebuff("m", 1, start).await;
+        assert!(g.limit("m", start).await > 0);
         let much_later = start + DISSOLVE_AFTER + Duration::from_secs(1);
         assert_eq!(
-            g.limit("m", much_later),
+            g.limit("m", much_later).await,
             0,
             "the provider's ceiling moves with other tenants; a stale cap is wrong"
         );

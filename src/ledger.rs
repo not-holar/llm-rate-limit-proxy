@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::RwLock;
+use tokio::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -92,9 +92,9 @@ impl Ledger {
     /// Takes the current absolute values rather than a delta, because that is
     /// what the metrics registry can report and it makes the operation
     /// idempotent — running it twice on the same tick cannot double-count.
-    pub fn absorb(&self, current: &[(String, Usage)]) {
-        let baseline = self.baseline.read().unwrap();
-        let mut live = self.live.write().unwrap();
+    pub async fn absorb(&self, current: &[(String, Usage)]) {
+        let baseline = self.baseline.read().await;
+        let mut live = self.live.write().await;
         for (model, now) in current {
             let base = baseline.get(model).copied().unwrap_or_default();
             live.insert(model.clone(), base.plus(*now));
@@ -107,8 +107,8 @@ impl Ledger {
     }
 
     /// Lifetime usage priced at `rates`, largest saving first.
-    pub fn savings(&self, rates: &HashMap<String, Rate>) -> Vec<Saving> {
-        let live = self.live.read().unwrap();
+    pub async fn savings(&self, rates: &HashMap<String, Rate>) -> Vec<Saving> {
+        let live = self.live.read().await;
         let mut out: Vec<Saving> = live
             .iter()
             .filter(|(_, u)| u.prompt_tokens > 0 || u.completion_tokens > 0)
@@ -144,8 +144,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_restart_does_not_erase_what_came_before() {
+    #[tokio::test]
+    async fn a_restart_does_not_erase_what_came_before() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("usage.json");
 
@@ -156,24 +156,24 @@ mod tests {
         let second = Ledger::load(Some(path.clone()));
         second.absorb(&[("m".into(), usage(3, 400, 40))]);
 
-        let s = &second.savings(&HashMap::new())[0];
+        let s = &second.savings(&HashMap::new()).await[0];
         assert_eq!(s.requests, 13, "totals must span processes");
         assert_eq!(s.prompt_tokens, 1_400);
         assert_eq!(s.completion_tokens, 140);
     }
 
-    #[test]
-    fn absorbing_the_same_counters_twice_does_not_double_count() {
+    #[tokio::test]
+    async fn absorbing_the_same_counters_twice_does_not_double_count() {
         // The tick reports absolute values, so a retry or an overlapping tick
         // must be harmless — otherwise the headline number inflates on its own.
         let led = Ledger::load(None);
         led.absorb(&[("m".into(), usage(5, 500, 50))]);
         led.absorb(&[("m".into(), usage(5, 500, 50))]);
-        assert_eq!(led.savings(&HashMap::new())[0].prompt_tokens, 500);
+        assert_eq!(led.savings(&HashMap::new()).await[0].prompt_tokens, 500);
     }
 
-    #[test]
-    fn cost_is_priced_per_million_tokens_each_way() {
+    #[tokio::test]
+    async fn cost_is_priced_per_million_tokens_each_way() {
         let led = Ledger::load(None);
         led.absorb(&[("m".into(), usage(1, 2_000_000, 500_000))]);
         let rates = HashMap::from([(
@@ -184,20 +184,20 @@ mod tests {
             },
         )]);
         // 2 Mtok in at $0.60 = $1.20, 0.5 Mtok out at $2.00 = $1.00.
-        assert!((led.savings(&rates)[0].usd - 2.20).abs() < 1e-9);
+        assert!((led.savings(&rates).await[0].usd - 2.20).abs() < 1e-9);
     }
 
-    #[test]
-    fn an_unpriced_model_falls_back_rather_than_vanishing() {
+    #[tokio::test]
+    async fn an_unpriced_model_falls_back_rather_than_vanishing() {
         let led = Ledger::load(None);
         led.absorb(&[("surprise".into(), usage(1, 1_000_000, 0))]);
-        let s = &led.savings(&HashMap::new())[0];
+        let s = &led.savings(&HashMap::new()).await[0];
         assert_eq!(s.input_per_mtok, DEFAULT_RATE.input_per_mtok);
         assert!((s.usd - DEFAULT_RATE.input_per_mtok).abs() < 1e-9);
     }
 
-    #[test]
-    fn models_that_served_nothing_are_omitted() {
+    #[tokio::test]
+    async fn models_that_served_nothing_are_omitted() {
         // /v1/props and /v1/models are recorded as models by the metrics layer
         // but carry no tokens; a row of zeroes priced at zero is noise.
         let led = Ledger::load(None);
@@ -205,19 +205,19 @@ mod tests {
             ("real".into(), usage(1, 100, 10)),
             ("props".into(), usage(9, 0, 0)),
         ]);
-        let s = led.savings(&HashMap::new());
+        let s = led.savings(&HashMap::new()).await;
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].model, "real");
     }
 
-    #[test]
-    fn the_biggest_saving_is_listed_first() {
+    #[tokio::test]
+    async fn the_biggest_saving_is_listed_first() {
         let led = Ledger::load(None);
         led.absorb(&[
             ("small".into(), usage(1, 1_000, 0)),
             ("large".into(), usage(1, 9_000_000, 0)),
         ]);
-        let s = led.savings(&HashMap::new());
+        let s = led.savings(&HashMap::new()).await;
         assert_eq!(s[0].model, "large");
     }
 }

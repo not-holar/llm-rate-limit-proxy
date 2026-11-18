@@ -2,16 +2,16 @@
 //! superuser and the first provider key. Until that happens the data plane is
 //! closed and browsers are sent here; afterwards this surface is inert.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
-use axum::extract::State;
-use axum::http::{header, StatusCode};
-use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::Form;
+use axum::extract::State;
+use axum::http::{StatusCode, header};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use serde::Deserialize;
 
-use crate::{auth, config, AppState};
+use crate::{AppState, auth, config};
 
 const SETUP_HTML: &str = r#"<!doctype html><meta charset=utf-8>
 <meta name=viewport content="width=device-width, initial-scale=1">
@@ -78,7 +78,7 @@ pub async fn setup_submit(
     {
         // Hold the store mutex across the whole build → save so a second concurrent
         // claim can't interleave.
-        let mut store = state.store.lock().unwrap();
+        let mut store = state.store.lock().await;
         if store.superuser().is_some() {
             return (StatusCode::CONFLICT, "setup already complete").into_response();
         }
@@ -111,11 +111,9 @@ pub async fn setup_submit(
     state.setup_required.store(false, Ordering::Relaxed);
 
     // Rebuild the live pool so the just-added provider key is usable immediately.
-    let specs = crate::pool::lane_specs(&state.store.lock().unwrap());
-    *state.pool.write().unwrap() = Arc::new(crate::pool::Pool::for_provider_window(
-        specs,
-        state.provider_window,
-    ));
+    let specs = crate::pool::lane_specs(&state.store.lock().await.to_owned());
+    *state.pool.write().await =
+        crate::pool::Pool::for_provider_window(specs, state.provider_window);
 
     Html(format!(
         "<!doctype html><meta charset=utf-8><title>LLM Rate Limit Proxy — Ready</title>\

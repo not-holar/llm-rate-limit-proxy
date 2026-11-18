@@ -13,9 +13,10 @@ pub mod settings;
 pub mod setup;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
-use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+use tokio::sync::{Mutex, RwLock};
 
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
@@ -64,10 +65,11 @@ pub struct AppState {
 
 /// This process's per-model counters, in the shape the ledger folds onto its
 /// persisted baseline.
-fn per_model_usage(state: &Arc<AppState>) -> Vec<(String, ledger::Usage)> {
+async fn per_model_usage(state: &Arc<AppState>) -> Vec<(String, ledger::Usage)> {
     state
         .metrics
         .stats()
+        .await
         .models
         .into_iter()
         .map(|m| {
@@ -89,13 +91,13 @@ fn per_model_usage(state: &Arc<AppState>) -> Vec<(String, ledger::Usage)> {
 /// lagging up to five minutes behind — the difference is invisible on a long
 /// view and glaring when someone opens the tab right after a big session.
 async fn api_savings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    state.ledger.absorb(&per_model_usage(&state));
+    state.ledger.absorb(&per_model_usage(&state).await);
     let rates = {
-        let store = state.store.lock().unwrap();
+        let store = state.store.lock().await;
         store.settings.model_rates.clone()
     };
     Json(serde_json::json!({
-        "rows": state.ledger.savings(&rates),
+        "rows": state.ledger.savings(&rates).await,
         "default_rate": ledger::DEFAULT_RATE,
     }))
 }
@@ -106,7 +108,7 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4",
         )],
-        state.metrics.render(),
+        state.metrics.render().await,
     )
 }
 
@@ -117,11 +119,11 @@ async fn api_history(
     let now = unix_now();
     let get = |k: &str, d: u64| q.get(k).and_then(|v| v.parse().ok()).unwrap_or(d);
     let (from, to) = (get("from", now.saturating_sub(86_400)), get("to", now));
-    Json(state.history.range(from, to, 500))
+    Json(state.history.range(from, to, 500).await)
 }
 
 async fn api_stats(State(state): State<Arc<AppState>>) -> Json<metrics::Stats> {
-    Json(state.metrics.stats())
+    Json(state.metrics.stats().await)
 }
 
 /// Models currently held back by provider-side pressure. Separate from rate
@@ -130,13 +132,13 @@ async fn api_stats(State(state): State<Arc<AppState>>) -> Json<metrics::Stats> {
 /// a stalled agent needs this to be visible somewhere.
 async fn api_pressure(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
-        "pressured": state.governor.pressured(std::time::Instant::now()),
+        "pressured": state.governor.pressured(std::time::Instant::now()).await,
     }))
 }
 
 /// Live bootstrap config for the dashboard (pool shape, capacity, uptime).
 async fn dash_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let pool = state.pool.read().unwrap().clone();
+    let pool = state.pool.read().await;
     Json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "lanes": pool.len(),
@@ -178,7 +180,7 @@ async fn source_allowlist(
         return next.run(req).await;
     }
     let rules: Vec<net::Rule> = {
-        let store = state.store.lock().unwrap();
+        let store = state.store.lock().await;
         store
             .settings
             .allow_from
@@ -311,10 +313,10 @@ pub async fn run() {
         .parse::<u64>()
         .map(Duration::from_millis)
         .unwrap_or(pool::PROVIDER_WINDOW);
-    let pool: pool::PoolHandle = Arc::new(RwLock::new(Arc::new(pool::Pool::for_provider_window(
+    let pool: pool::PoolHandle = Arc::new(RwLock::new(pool::Pool::for_provider_window(
         pool::lane_specs(&stored),
         provider_window,
-    ))));
+    )));
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         // No overall timeout: generations can stream for a long time.
@@ -354,10 +356,10 @@ pub async fn run() {
         .max(1);
         tokio::spawn(async move {
             loop {
-                history.append(unix_now(), sampled.metrics.total());
+                history.append(unix_now(), sampled.metrics.total().await);
                 // Same tick, because both answer "what has happened here" and a
                 // separate timer would only add a second thing to reason about.
-                sampled.ledger.absorb(&per_model_usage(&sampled));
+                sampled.ledger.absorb(&per_model_usage(&sampled).await);
                 tokio::time::sleep(Duration::from_secs(sample_secs)).await;
             }
         });
