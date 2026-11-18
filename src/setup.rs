@@ -111,7 +111,7 @@ pub async fn setup_submit(
     state.setup_required.store(false, Ordering::Relaxed);
 
     // Rebuild the live pool so the just-added provider key is usable immediately.
-    let specs = crate::pool::lane_specs(&state.store.lock().await.to_owned());
+    let specs = crate::pool::lane_specs(&state.store.lock().await.clone());
     *state.pool.write().await =
         crate::pool::Pool::for_provider_window(specs, state.provider_window);
 

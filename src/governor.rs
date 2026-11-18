@@ -278,7 +278,7 @@ mod tests {
         let g = governor();
         let now = Instant::now();
         for _ in 0..10 {
-            g.note_rebuff("m", 0, now);
+            g.note_rebuff("m", 0, now).await;
         }
         assert_eq!(g.limit("m", now).await, 0);
     }
@@ -290,9 +290,9 @@ mod tests {
     async fn rebuffs_across_distinct_keys_indict_the_model() {
         let g = governor();
         let now = Instant::now();
-        g.note_rebuff("m", 0, now);
+        g.note_rebuff("m", 0, now).await;
         assert_eq!(g.limit("m", now).await, 0, "one key is not yet evidence");
-        g.note_rebuff("m", 1, now);
+        g.note_rebuff("m", 1, now).await;
         assert!(
             g.limit("m", now).await > 0,
             "two distinct keys indicts the model"
@@ -303,11 +303,11 @@ mod tests {
     async fn evidence_older_than_the_window_is_not_counted() {
         let g = governor();
         let start = Instant::now();
-        g.note_rebuff("m", 0, start);
+        g.note_rebuff("m", 0, start).await;
         // The first rebuff has aged out by the time the second key fails, so the
         // two never coexist as evidence and the model stays ungoverned.
         let later = start + EVIDENCE_WINDOW + Duration::from_secs(1);
-        g.note_rebuff("m", 1, later);
+        g.note_rebuff("m", 1, later).await;
         assert_eq!(g.limit("m", later).await, 0);
     }
 
@@ -315,8 +315,8 @@ mod tests {
     async fn one_models_pressure_does_not_govern_another() {
         let g = governor();
         let now = Instant::now();
-        g.note_rebuff("busy", 0, now);
-        g.note_rebuff("busy", 1, now);
+        g.note_rebuff("busy", 0, now).await;
+        g.note_rebuff("busy", 1, now).await;
         assert!(g.limit("busy", now).await > 0);
         assert_eq!(g.limit("quiet", now).await, 0, "pressure is per model");
     }
@@ -327,8 +327,8 @@ mod tests {
         let now = Instant::now();
         // Four in flight when the pressure shows up, so the cap lands at two.
         let held: Vec<_> = (0..4).map(async |_| admit(&g, "m", now).await).collect();
-        g.note_rebuff("m", 0, now);
-        g.note_rebuff("m", 1, now);
+        g.note_rebuff("m", 0, now).await;
+        g.note_rebuff("m", 1, now).await;
         assert_eq!(g.limit("m", now).await, 2);
         drop(held);
 
@@ -401,7 +401,7 @@ mod tests {
             .collect()
             .await;
         for lane in 0..8 {
-            g.note_rebuff("m", lane, now);
+            g.note_rebuff("m", lane, now).await;
         }
         assert_eq!(
             g.limit("m", now).await,
@@ -428,8 +428,8 @@ mod tests {
             .then(|_| admit(&g, "m", start))
             .collect()
             .await;
-        g.note_rebuff("m", 0, start);
-        g.note_rebuff("m", 1, start);
+        g.note_rebuff("m", 0, start).await;
+        g.note_rebuff("m", 1, start).await;
         assert_eq!(
             g.limit("m", start).await,
             4,
@@ -466,8 +466,8 @@ mod tests {
                 .filter(|x| x.is_some())
                 .collect()
                 .await;
-            g.note_rebuff("m", round * 2, now);
-            g.note_rebuff("m", round * 2 + 1, now);
+            g.note_rebuff("m", round * 2, now).await;
+            g.note_rebuff("m", round * 2 + 1, now).await;
             drop(held);
             now += ADJUST_COOLDOWN + Duration::from_secs(1);
         }

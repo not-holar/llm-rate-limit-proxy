@@ -150,11 +150,11 @@ mod tests {
         let path = dir.path().join("usage.json");
 
         let first = Ledger::load(Some(path.clone()));
-        first.absorb(&[("m".into(), usage(10, 1_000, 100))]);
+        first.absorb(&[("m".into(), usage(10, 1_000, 100))]).await;
 
         // A new process: metrics are back at zero and climb again from there.
         let second = Ledger::load(Some(path.clone()));
-        second.absorb(&[("m".into(), usage(3, 400, 40))]);
+        second.absorb(&[("m".into(), usage(3, 400, 40))]).await;
 
         let s = &second.savings(&HashMap::new()).await[0];
         assert_eq!(s.requests, 13, "totals must span processes");
@@ -167,15 +167,16 @@ mod tests {
         // The tick reports absolute values, so a retry or an overlapping tick
         // must be harmless — otherwise the headline number inflates on its own.
         let led = Ledger::load(None);
-        led.absorb(&[("m".into(), usage(5, 500, 50))]);
-        led.absorb(&[("m".into(), usage(5, 500, 50))]);
+        led.absorb(&[("m".into(), usage(5, 500, 50))]).await;
+        led.absorb(&[("m".into(), usage(5, 500, 50))]).await;
         assert_eq!(led.savings(&HashMap::new()).await[0].prompt_tokens, 500);
     }
 
     #[tokio::test]
     async fn cost_is_priced_per_million_tokens_each_way() {
         let led = Ledger::load(None);
-        led.absorb(&[("m".into(), usage(1, 2_000_000, 500_000))]);
+        led.absorb(&[("m".into(), usage(1, 2_000_000, 500_000))])
+            .await;
         let rates = HashMap::from([(
             "m".to_string(),
             Rate {
@@ -190,7 +191,8 @@ mod tests {
     #[tokio::test]
     async fn an_unpriced_model_falls_back_rather_than_vanishing() {
         let led = Ledger::load(None);
-        led.absorb(&[("surprise".into(), usage(1, 1_000_000, 0))]);
+        led.absorb(&[("surprise".into(), usage(1, 1_000_000, 0))])
+            .await;
         let s = &led.savings(&HashMap::new()).await[0];
         assert_eq!(s.input_per_mtok, DEFAULT_RATE.input_per_mtok);
         assert!((s.usd - DEFAULT_RATE.input_per_mtok).abs() < 1e-9);
@@ -204,7 +206,8 @@ mod tests {
         led.absorb(&[
             ("real".into(), usage(1, 100, 10)),
             ("props".into(), usage(9, 0, 0)),
-        ]);
+        ])
+        .await;
         let s = led.savings(&HashMap::new()).await;
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].model, "real");
@@ -216,7 +219,8 @@ mod tests {
         led.absorb(&[
             ("small".into(), usage(1, 1_000, 0)),
             ("large".into(), usage(1, 9_000_000, 0)),
-        ]);
+        ])
+        .await;
         let s = led.savings(&HashMap::new()).await;
         assert_eq!(s[0].model, "large");
     }

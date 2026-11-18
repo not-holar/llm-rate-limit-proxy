@@ -35,7 +35,7 @@ impl Dispatcher {
     /// Acquire any rate slot, blocking until one is available. Convenience for
     /// callers that don't care which provider or lane serves them.
     pub async fn acquire(&self) -> Permit {
-        self.acquire_for(None, &[], None, None, None)
+        self.acquire_for(None, &[], None, None)
             .await
             .expect("acquire on a non-empty pool")
     }
@@ -50,7 +50,6 @@ impl Dispatcher {
         exclude: &[usize],
         session: Option<u64>,
         protocol: Option<Protocol>,
-        model: Option<&str>,
     ) -> Option<Permit> {
         loop {
             let _fifo = self.gate.lock().await;
@@ -74,14 +73,14 @@ impl Dispatcher {
                 // A lane the provider told us to back off from stays out of
                 // rotation until its cooldown ends, but still counts as eligible
                 // so an all-benched pool waits instead of reporting itself empty.
-                if let Some(until) = lane.cooldown_ends(model, now) {
+                if let Some(until) = lane.cooldown_ends(now).await {
                     soonest = Some(soonest.map_or(until, |s: Instant| s.min(until)));
                     continue;
                 }
-                let load = lane.load(now);
+                let load = lane.load(now).await;
                 if load < lane.rpm {
                     with_room.push((load, idx));
-                } else if let Err(retry_at) = lane.try_acquire(now) {
+                } else if let Err(retry_at) = lane.try_acquire(now).await {
                     // A saturated lane records nothing, so this only reads its clock.
                     soonest = Some(soonest.map_or(retry_at, |s: Instant| s.min(retry_at)));
                 }
@@ -95,7 +94,7 @@ impl Dispatcher {
                 .or_else(|| with_room.iter().min().map(|&(_, i)| i));
             if let Some(idx) = choice {
                 let lane = &pool.lanes()[idx];
-                if lane.try_acquire(now).is_ok() {
+                if lane.try_acquire(now).await.is_ok() {
                     return Some(Permit {
                         lane_idx: idx,
                         provider: lane.provider.clone(),
@@ -131,6 +130,7 @@ mod tests {
             provider: name.into(),
             base_url: format!("http://{name}.test"),
             key: format!("{name}-key"),
+            model: format!("models/{name}-fav"),
             rpm,
             protocol: Default::default(),
             no_v1: false,
@@ -163,23 +163,11 @@ mod tests {
         let pool = Pool::with_window(vec![spec("a", 2), spec("b", 2)], Duration::from_secs(60));
         let d = Dispatcher::new(handle(pool));
         let s = Some(0xBEEFu64);
-        let first = d
-            .acquire_for(None, &[], s, None, None)
-            .await
-            .unwrap()
-            .lane_idx;
-        let second = d
-            .acquire_for(None, &[], s, None, None)
-            .await
-            .unwrap()
-            .lane_idx;
+        let first = d.acquire_for(None, &[], s, None).await.unwrap().lane_idx;
+        let second = d.acquire_for(None, &[], s, None).await.unwrap().lane_idx;
         assert_eq!(first, second, "a session should stay on its own lane");
         // That lane is now at its rpm of 2, so the third has to spill.
-        let third = d
-            .acquire_for(None, &[], s, None, None)
-            .await
-            .unwrap()
-            .lane_idx;
+        let third = d.acquire_for(None, &[], s, None).await.unwrap().lane_idx;
         assert_ne!(third, first, "a full affinity lane must spill, not block");
     }
 
@@ -199,7 +187,9 @@ mod tests {
     #[tokio::test]
     async fn a_benched_lane_is_skipped_for_a_healthy_one() {
         let pool = Pool::with_window(vec![spec("a", 40), spec("b", 40)], Duration::from_secs(60));
-        pool.lanes()[0].bench("x", Instant::now() + Duration::from_secs(30));
+        pool.lanes()[0]
+            .bench(Instant::now() + Duration::from_secs(30))
+            .await;
         let d = Dispatcher::new(handle(pool));
         for _ in 0..3 {
             assert_eq!(
@@ -213,7 +203,9 @@ mod tests {
     #[tokio::test]
     async fn every_lane_benched_waits_out_the_cooldown_rather_than_failing() {
         let pool = Pool::with_window(vec![spec("a", 40)], Duration::from_secs(60));
-        pool.lanes()[0].bench("x", Instant::now() + Duration::from_millis(200));
+        pool.lanes()[0]
+            .bench(Instant::now() + Duration::from_millis(200))
+            .await;
         let d = Dispatcher::new(handle(pool));
         let t0 = Instant::now();
         assert_eq!(d.acquire().await.lane_idx, 0);

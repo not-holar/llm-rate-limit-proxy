@@ -91,7 +91,7 @@ async fn per_model_usage(state: &Arc<AppState>) -> Vec<(String, ledger::Usage)> 
 /// lagging up to five minutes behind — the difference is invisible on a long
 /// view and glaring when someone opens the tab right after a big session.
 async fn api_savings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    state.ledger.absorb(&per_model_usage(&state).await);
+    state.ledger.absorb(&per_model_usage(&state).await).await;
     let rates = {
         let store = state.store.lock().await;
         store.settings.model_rates.clone()
@@ -191,7 +191,7 @@ async fn source_allowlist(
     if net::permitted(&rules, peer.ip()) {
         next.run(req).await
     } else {
-        state.metrics.record_event("blocked_source");
+        state.metrics.record_event("blocked_source").await;
         (
             axum::http::StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -356,10 +356,15 @@ pub async fn run() {
         .max(1);
         tokio::spawn(async move {
             loop {
-                history.append(unix_now(), sampled.metrics.total().await);
+                history
+                    .append(unix_now(), sampled.metrics.total().await)
+                    .await;
                 // Same tick, because both answer "what has happened here" and a
                 // separate timer would only add a second thing to reason about.
-                sampled.ledger.absorb(&per_model_usage(&sampled).await);
+                sampled
+                    .ledger
+                    .absorb(&per_model_usage(&sampled).await)
+                    .await;
                 tokio::time::sleep(Duration::from_secs(sample_secs)).await;
             }
         });

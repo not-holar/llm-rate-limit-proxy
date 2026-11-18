@@ -568,9 +568,9 @@ mod tests {
     #[tokio::test]
     async fn counts_accumulate_per_series() {
         let m = Metrics::default();
-        m.record_request("alice", "gpt", "200");
-        m.record_request("alice", "gpt", "200");
-        m.record_request("alice", "gpt", "429");
+        m.record_request("alice", "gpt", "200").await;
+        m.record_request("alice", "gpt", "200").await;
+        m.record_request("alice", "gpt", "429").await;
         let out = m.render().await;
         assert!(out.contains(
             r#"llm_rate_limit_proxy_requests_total{client="alice",model="gpt",status="200"} 2"#
@@ -586,7 +586,7 @@ mod tests {
         assert_eq!(sanitize(""), "unknown");
         // Unsafe chars are filtered out, so nothing can break the exposition format.
         let m = Metrics::default();
-        m.record_request("x", "evil\"\nmodel", "200");
+        m.record_request("x", "evil\"\nmodel", "200").await;
         assert!(
             m.render().await.contains(r#"model="evilmodel""#),
             "got: {}",
@@ -598,7 +598,7 @@ mod tests {
     async fn series_count_is_capped() {
         let m = Metrics::default();
         for i in 0..(MAX_SERIES + 50) {
-            m.record_request("c", &format!("model-{i}"), "200");
+            m.record_request("c", &format!("model-{i}"), "200").await;
         }
         let series = m
             .render()
@@ -617,8 +617,8 @@ mod tests {
     async fn latency_and_token_series_are_capped_too() {
         let m = Metrics::default();
         for i in 0..(MAX_SERIES + 200) {
-            m.record_latency(&format!("model-{i}"), 10);
-            m.record_tokens(&format!("model-{i}"), 1, 1);
+            m.record_latency(&format!("model-{i}"), 10).await;
+            m.record_tokens(&format!("model-{i}"), 1, 1).await;
         }
         assert!(
             m.latency.lock().await.len() <= MAX_SERIES + 1,
@@ -635,11 +635,11 @@ mod tests {
     #[tokio::test]
     async fn ttft_and_speed_surface_per_model() {
         let m = Metrics::default();
-        m.record_request("c", "fast", "200");
-        m.record_ttft("fast", 120);
-        m.record_ttft("fast", 480);
+        m.record_request("c", "fast", "200").await;
+        m.record_ttft("fast", 120).await;
+        m.record_ttft("fast", 480).await;
         // 200 completion tokens in 2s = 100/sec
-        m.record_speed("fast", 200, 2000);
+        m.record_speed("fast", 200, 2000).await;
         let s = m.stats().await;
         let f = s.models.iter().find(|x| x.model == "fast").unwrap();
         assert_eq!(f.avg_ttft_ms, 300, "average of 120 and 480");
@@ -651,9 +651,9 @@ mod tests {
     #[tokio::test]
     async fn speed_ignores_measurements_it_cannot_trust() {
         let m = Metrics::default();
-        m.record_request("c", "m", "200");
-        m.record_speed("m", 0, 1000);
-        m.record_speed("m", 100, 0);
+        m.record_request("c", "m", "200").await;
+        m.record_speed("m", 0, 1000).await;
+        m.record_speed("m", 100, 0).await;
         assert_eq!(m.stats().await.models[0].avg_tokens_per_sec, 0);
     }
 
@@ -661,10 +661,10 @@ mod tests {
     #[tokio::test]
     async fn truncation_is_counted_separately_from_completion() {
         let m = Metrics::default();
-        m.record_request("c", "m", "200");
-        m.record_finish("m", "stop");
-        m.record_finish("m", "length");
-        m.record_finish("m", "length");
+        m.record_request("c", "m", "200").await;
+        m.record_finish("m", "stop").await;
+        m.record_finish("m", "length").await;
+        m.record_finish("m", "length").await;
         assert_eq!(m.stats().await.models[0].truncated, 2);
     }
 
@@ -682,11 +682,11 @@ mod tests {
     #[tokio::test]
     async fn events_and_shape_reach_the_dashboard() {
         let m = Metrics::default();
-        m.record_event("retry");
-        m.record_event("retry");
-        m.record_event("shed");
-        m.record_queue_wait(250);
-        m.record_shape("opencode", 12, 4, 4096, 20);
+        m.record_event("retry").await;
+        m.record_event("retry").await;
+        m.record_event("shed").await;
+        m.record_queue_wait(250).await;
+        m.record_shape("opencode", 12, 4, 4096, 20).await;
         m.record_stream_mix(true);
         m.record_stream_mix(false);
         let s = m.stats().await;
@@ -704,12 +704,12 @@ mod tests {
     async fn every_new_series_is_capped_too() {
         let m = Metrics::default();
         for i in 0..(MAX_SERIES + 200) {
-            m.record_ttft(&format!("model-{i}"), 1);
-            m.record_speed(&format!("model-{i}"), 10, 100);
-            m.record_extras(&format!("model-{i}"), 1, 1);
-            m.record_shape(&format!("client-{i}"), 1, 1, 1, 1);
-            m.record_event(&format!("kind-{i}"));
-            m.record_finish(&format!("model-{i}"), "stop");
+            m.record_ttft(&format!("model-{i}"), 1).await;
+            m.record_speed(&format!("model-{i}"), 10, 100).await;
+            m.record_extras(&format!("model-{i}"), 1, 1).await;
+            m.record_shape(&format!("client-{i}"), 1, 1, 1, 1).await;
+            m.record_event(&format!("kind-{i}")).await;
+            m.record_finish(&format!("model-{i}"), "stop").await;
         }
         let cap = MAX_SERIES + 1;
         assert!(m.ttft_ms.lock().await.len() <= cap);
@@ -723,13 +723,13 @@ mod tests {
     #[tokio::test]
     async fn stats_aggregate_by_dimension() {
         let m = Metrics::default();
-        m.record_request("alice", "gpt", "200");
-        m.record_request("bob", "gpt", "200");
-        m.record_request("alice", "claude", "429");
-        m.record_latency("gpt", 100);
-        m.record_latency("gpt", 300);
-        m.record_tokens("gpt", 10, 20);
-        m.record_lane("nim");
+        m.record_request("alice", "gpt", "200").await;
+        m.record_request("bob", "gpt", "200").await;
+        m.record_request("alice", "claude", "429").await;
+        m.record_latency("gpt", 100).await;
+        m.record_latency("gpt", 300).await;
+        m.record_tokens("gpt", 10, 20).await;
+        m.record_lane("nim").await;
 
         let s = m.stats().await;
         assert_eq!(s.total, 3);

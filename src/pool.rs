@@ -3,10 +3,10 @@
 //! rolling window, matching a real provider's limiter rather than a burstable
 //! token bucket.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 use crate::config::{Protocol, StoredConfig};
 
@@ -76,18 +76,20 @@ pub struct Lane {
     pub provider: String,
     pub base_url: String,
     pub key: String,
+    pub model: String,
     pub rpm: usize,
     pub protocol: Protocol,
     pub no_v1: bool,
     limiter: Mutex<SlidingWindow>,
-    cooldowns: Mutex<HashMap<String, Instant>>,
+    pub cooldown_until: Mutex<Option<Instant>>,
 }
 
 impl Lane {
     fn new(spec: LaneSpec, window: Duration) -> Self {
         Self {
             limiter: Mutex::new(SlidingWindow::new(spec.rpm, window)),
-            cooldowns: Mutex::new(HashMap::new()),
+            cooldown_until: Mutex::new(None),
+            model: spec.model,
             provider: spec.provider,
             base_url: spec.base_url,
             key: spec.key,
@@ -97,50 +99,47 @@ impl Lane {
         }
     }
 
-    /// Take this lane out of rotation for a specific model until `until`.
-    pub fn bench(&self, model: &str, until: Instant) {
-        let mut cooldowns = self.cooldowns.lock().unwrap();
-        let entry = cooldowns.entry(model.to_string()).or_insert(until);
-        *entry = (*entry).max(until);
+    /// Take this lane out of rotation until `until`. A key that just answered 429
+    /// or 5xx will answer the same way to the next request, so the rebuff has to
+    /// be remembered by the pool rather than only by the request that found it.
+    pub async fn bench(&self, until: Instant) {
+        let mut saved_cooldown = self.cooldown_until.lock().await;
+        // Never shorten a bench already in force: concurrent failures on the same
+        // lane must not let a smaller backoff cancel a larger one.
+        *saved_cooldown = Some(saved_cooldown.map_or(until, |current| current.max(until)));
     }
 
-    pub fn is_benched(&self, model: &str, now: Instant) -> bool {
-        self.cooldowns
+    pub async fn is_benched(&self, now: Instant) -> bool {
+        self.cooldown_until
             .lock()
-            .unwrap()
-            .get(model)
-            .is_some_and(|&until| until > now)
+            .await
+            .is_some_and(|until| until > now)
     }
 
-    /// When this lane's cooldown for a specific model (or any model if None) ends, if it is benched right now.
-    pub fn cooldown_ends(&self, model: Option<&str>, now: Instant) -> Option<Instant> {
-        let cooldowns = self.cooldowns.lock().unwrap();
-        match model {
-            Some(m) => cooldowns.get(m).filter(|&&until| until > now).copied(),
-            None => cooldowns
-                .values()
-                .filter(|&&until| until > now)
-                .max()
-                .copied(),
-        }
+    /// When this lane's cooldown ends, if it is benched right now.
+    pub async fn cooldown_ends(&self, now: Instant) -> Option<Instant> {
+        self.cooldown_until
+            .lock()
+            .await
+            .filter(|&until| until > now)
     }
 
-    pub fn try_acquire(&self, now: Instant) -> Result<(), Instant> {
-        self.limiter.lock().unwrap().try_acquire(now)
+    pub async fn try_acquire(&self, now: Instant) -> Result<(), Instant> {
+        self.limiter.lock().await.try_acquire(now)
     }
 
     /// Spent budget in the current window, for picking the least-loaded lane.
-    pub fn load(&self, now: Instant) -> usize {
-        self.limiter.lock().unwrap().load(now)
+    pub async fn load(&self, now: Instant) -> usize {
+        self.limiter.lock().await.load(now)
     }
 
     /// Adopt another lane's spent budget and cooldown. Only the hits are copied,
     /// not the limit, so a key whose rpm was just lowered is held to the new
     /// figure immediately rather than from the next window.
-    fn carry_from(&self, old: &Lane) {
-        let hits = old.limiter.lock().unwrap().hits.clone();
-        self.limiter.lock().unwrap().hits = hits;
-        *self.cooldowns.lock().unwrap() = old.cooldowns.lock().unwrap().clone();
+    async fn carry_from(&self, old: &Lane) {
+        let hits = old.limiter.lock().await.hits.to_owned();
+        self.limiter.lock().await.hits = hits;
+        *self.cooldown_until.lock().await = old.cooldown_until.lock().await.to_owned();
     }
 }
 
@@ -149,25 +148,33 @@ pub struct LaneSpec {
     pub provider: String,
     pub base_url: String,
     pub key: String,
+    pub model: String,
     pub rpm: usize,
     pub protocol: Protocol,
     pub no_v1: bool,
 }
 
-/// Flatten every enabled, non-zero-rpm key across all providers into lane specs.
+/// Flatten every enabled, non-zero-rpm alias target model across all matching provider-key combinations into lane specs.
 pub fn lane_specs(sc: &StoredConfig) -> Vec<LaneSpec> {
     let mut specs = Vec::new();
-    for p in &sc.providers {
-        for k in &p.keys {
-            if k.enabled && k.rpm > 0 {
-                specs.push(LaneSpec {
-                    provider: p.name.clone(),
-                    base_url: p.base_url.clone(),
-                    key: k.key.clone(),
-                    rpm: k.rpm,
-                    protocol: p.protocol,
-                    no_v1: p.no_v1,
-                });
+    for target in sc.aliases.iter().flat_map(|alias| alias.targets.to_owned()) {
+        for provider in sc
+            .providers
+            .iter()
+            .filter(|provider| provider.name == target.provider)
+        {
+            for key in &provider.keys {
+                if key.enabled && key.rpm > 0 {
+                    specs.push(LaneSpec {
+                        provider: provider.name.to_owned(),
+                        base_url: provider.base_url.to_owned(),
+                        key: key.key.to_owned(),
+                        model: target.model.to_owned(),
+                        rpm: key.rpm,
+                        protocol: provider.protocol,
+                        no_v1: provider.no_v1,
+                    });
+                }
             }
         }
     }
@@ -207,21 +214,23 @@ impl Pool {
     /// precisely when someone is editing settings, because they are at capacity
     /// and adding keys. A key is matched by provider and secret, so renaming or
     /// reordering keeps its state and a genuinely new key starts clean.
-    pub fn rebuild(&self, specs: Vec<LaneSpec>) -> Self {
-        let lanes: Vec<Lane> = specs
-            .into_iter()
-            .map(|spec| {
-                let lane = Lane::new(spec, self.window);
-                if let Some(old) = self
-                    .lanes
-                    .iter()
-                    .find(|l| l.provider == lane.provider && l.key == lane.key)
-                {
-                    lane.carry_from(old);
-                }
-                lane
-            })
-            .collect();
+    pub async fn rebuild(&self, specs: Vec<LaneSpec>) -> Self {
+        let mut lanes = Vec::new();
+
+        for lane in specs.into_iter().map(async |spec| {
+            let lane = Lane::new(spec, self.window);
+            if let Some(old) = self
+                .lanes
+                .iter()
+                .find(|l| l.provider == lane.provider && l.key == lane.key)
+            {
+                lane.carry_from(old).await;
+            }
+            lane
+        }) {
+            lanes.push(lane.await)
+        }
+
         Self {
             lanes,
             window: self.window,
@@ -341,8 +350,8 @@ mod tests {
         assert_eq!(pool.rpms(), vec![40, 20]);
     }
 
-    #[test]
-    fn pool_lane_carries_provider_routing() {
+    #[tokio::test]
+    async fn pool_lane_carries_provider_routing() {
         let sc = StoredConfig {
             providers: vec![provider("nim", 40, true)],
             ..Default::default()
@@ -351,7 +360,7 @@ mod tests {
         let lane = &pool.lanes()[0];
         assert_eq!(lane.base_url, "http://nim.test");
         assert_eq!(lane.key, "nim-key");
-        assert!(lane.try_acquire(Instant::now()).is_ok());
+        assert!(lane.try_acquire(Instant::now()).await.is_ok());
     }
 
     fn specs(n: usize) -> Vec<LaneSpec> {
@@ -360,6 +369,7 @@ mod tests {
                 provider: "nim".into(),
                 base_url: "http://nim.test".into(),
                 key: format!("key-{i}"),
+                model: format!("models/{i}"),
                 rpm: 40,
                 protocol: Default::default(),
                 no_v1: false,
@@ -413,74 +423,78 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_benched_lane_is_out_of_rotation_until_its_cooldown_expires() {
+    #[tokio::test]
+    async fn a_benched_lane_is_out_of_rotation_until_its_cooldown_expires() {
         let pool = Pool::new(specs(1));
         let lane = &pool.lanes()[0];
         let now = Instant::now();
-        lane.bench("x", now + Duration::from_secs(5));
-        assert!(lane.is_benched("x", now));
-        assert!(!lane.is_benched("x", now + Duration::from_secs(6)));
+        lane.bench(now + Duration::from_secs(5)).await;
+        assert!(lane.is_benched(now).await);
+        assert!(!lane.is_benched(now + Duration::from_secs(6)).await);
     }
 
     /// Two requests can discover the same sick key at once. The shorter of their
     /// two backoffs must not cancel the longer one already in force.
-    #[test]
-    fn benching_a_lane_again_never_shortens_its_cooldown() {
+    #[tokio::test]
+    async fn benching_a_lane_again_never_shortens_its_cooldown() {
         let pool = Pool::new(specs(1));
         let lane = &pool.lanes()[0];
         let now = Instant::now();
-        lane.bench("x", now + Duration::from_secs(30));
-        lane.bench("x", now + Duration::from_secs(2));
-        assert!(lane.is_benched("x", now + Duration::from_secs(10)));
+        lane.bench(now + Duration::from_secs(30)).await;
+        lane.bench(now + Duration::from_secs(2)).await;
+        assert!(lane.is_benched(now + Duration::from_secs(10)).await);
     }
 
     /// A settings save must not hand every key a fresh rate window. Without
     /// carryover, editing anything at all lets the very next requests exceed the
     /// provider's limit — and editing settings is exactly what someone does while
     /// they are already at capacity and trying to add keys.
-    #[test]
-    fn a_rebuilt_pool_keeps_each_kept_keys_spent_budget() {
+    #[tokio::test]
+    async fn a_rebuilt_pool_keeps_each_kept_keys_spent_budget() {
         let pool = Pool::with_window(specs(2), Duration::from_secs(60));
         let now = Instant::now();
         for _ in 0..3 {
-            pool.lanes()[0].try_acquire(now).unwrap();
+            assert!(pool.lanes()[0].try_acquire(now).await.is_ok());
         }
-        assert_eq!(pool.lanes()[0].load(now), 3);
+        assert_eq!(pool.lanes()[0].load(now).await, 3);
 
-        let rebuilt = pool.rebuild(specs(2));
+        let rebuilt = pool.rebuild(specs(2)).await;
         assert_eq!(
-            rebuilt.lanes()[0].load(now),
+            rebuilt.lanes()[0].load(now).await,
             3,
             "the spent budget must survive the swap"
         );
         assert_eq!(
-            rebuilt.lanes()[1].load(now),
+            rebuilt.lanes()[1].load(now).await,
             0,
             "an untouched key is unaffected"
         );
     }
 
-    #[test]
-    fn a_rebuilt_pool_keeps_a_benched_lane_benched() {
+    #[tokio::test]
+    async fn a_rebuilt_pool_keeps_a_benched_lane_benched() {
         let pool = Pool::with_window(specs(1), Duration::from_secs(60));
         let now = Instant::now();
-        pool.lanes()[0].bench("x", now + Duration::from_secs(30));
-        assert!(pool.rebuild(specs(1)).lanes()[0].is_benched("x", now));
+        pool.lanes()[0].bench(now + Duration::from_secs(30)).await;
+        assert!(
+            pool.rebuild(specs(1)).await.lanes()[0]
+                .is_benched(now)
+                .await
+        );
     }
 
-    #[test]
-    fn a_newly_added_key_starts_with_a_clean_window() {
+    #[tokio::test]
+    async fn a_newly_added_key_starts_with_a_clean_window() {
         let pool = Pool::with_window(specs(1), Duration::from_secs(60));
         let now = Instant::now();
-        pool.lanes()[0].try_acquire(now).unwrap();
-        let grown = pool.rebuild(specs(2));
+        assert!(pool.lanes()[0].try_acquire(now).await.is_ok());
+        let grown = pool.rebuild(specs(2)).await;
         assert_eq!(
-            grown.lanes()[0].load(now),
+            grown.lanes()[0].load(now).await,
             1,
             "the existing key carries over"
         );
-        assert_eq!(grown.lanes()[1].load(now), 0, "the new key is fresh");
+        assert_eq!(grown.lanes()[1].load(now).await, 0, "the new key is fresh");
     }
 
     /// Affinity is keyed on lane identity, not lane index, so a pool rebuild that

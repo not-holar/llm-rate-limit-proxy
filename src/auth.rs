@@ -422,10 +422,10 @@ pub async fn login_submit(
         }
     };
     if !ok {
-        state.admin.record_login_failure();
+        state.admin.record_login_failure().await;
         return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
     }
-    state.admin.reset_login_failures();
+    state.admin.reset_login_failures().await;
     let token = state.admin.mint(&form.username, &witness, SESSION_TTL);
     let cookie = session_cookie(&token, state.admin.secure_cookies());
     (
@@ -630,10 +630,10 @@ mod tests {
         let a = Admin::new(false);
         for _ in 0..MAX_LOGIN_FAILS {
             assert!(!a.is_throttled().await);
-            a.record_login_failure();
+            a.record_login_failure().await;
         }
         assert!(a.is_throttled().await);
-        a.reset_login_failures();
+        a.reset_login_failures().await;
         assert!(!a.is_throttled().await);
     }
 

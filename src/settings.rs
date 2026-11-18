@@ -56,7 +56,7 @@ async fn apply(state: &Arc<AppState>) -> Result<(), String> {
     config::save(&state.data_dir, &snapshot)?;
     let rebuilt = {
         let current = state.pool.read().await;
-        current.rebuild(specs)
+        current.rebuild(specs).await
     };
     *state.pool.write().await = rebuilt;
     Ok(())

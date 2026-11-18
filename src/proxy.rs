@@ -16,6 +16,7 @@ use axum::response::{IntoResponse, Response};
 
 use crate::config::{Alias, Protocol};
 use crate::dispatch::Permit;
+use crate::pool::Lane;
 use crate::{AppState, auth, governor, models};
 
 const HEARTBEAT: Duration = Duration::from_secs(15);
@@ -120,8 +121,8 @@ fn is_retryable(status: u16) -> bool {
 /// what the caller meant, and being tolerant here costs a user nothing while
 /// saving them an afternoon.
 fn normalize_path(path_query: &str) -> String {
-    if path_query == "/v1" {
-        return "/v1".to_string();
+    if path_query.starts_with("/v1") && !path_query.starts_with("/v1/") {
+        return path_query.to_string();
     }
 
     format!(
@@ -214,10 +215,11 @@ struct RecordArgs<'a> {
     started: Instant,
 }
 
-fn record(state: &AppState, args: RecordArgs<'_>) {
+async fn record(state: &AppState, args: RecordArgs<'_>) {
     state
         .metrics
-        .record_request(args.client, args.virtual_model, args.status);
+        .record_request(args.client, args.virtual_model, args.status)
+        .await;
     // Which key carried it. For a key-rotation proxy this is the one field that
     // answers "is rotation actually spreading load", and its absence hides a
     // pool quietly collapsing onto one key.
@@ -252,8 +254,8 @@ async fn bench_lane(
     let cooldown = cooldown.unwrap_or(DEFAULT_BENCH);
     let pool = state.pool.read().await;
     if let Some(lane) = pool.lanes().get(lane_idx) {
-        lane.bench(model, Instant::now() + cooldown);
-        state.metrics.record_event("lane_benched");
+        lane.bench(Instant::now() + cooldown).await;
+        state.metrics.record_event("lane_benched").await;
         // Retries are invisible in the access log, which only records how a
         // request finally ended. Without this line an operator can see that the
         // governor engaged but has no way to count the pushback behind it.
@@ -479,9 +481,7 @@ async fn fetch_catalog(
 ) -> Option<Vec<serde_json::Value>> {
     let permit = with_deadline(
         deadline,
-        state
-            .dispatch
-            .acquire_for(Some(provider), &[], None, None, None),
+        state.dispatch.acquire_for(Some(provider), &[], None, None),
     )
     .await??;
     let rb = state.http.get(format!(
@@ -539,7 +539,7 @@ pub async fn handle(
         .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
         .and_then(|k| auth::verify_client_key(k, &clients));
     let Some(client) = client else {
-        state.metrics.record_event("unauthorized");
+        state.metrics.record_event("unauthorized").await;
         return err(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -560,7 +560,7 @@ pub async fn handle(
     // paid. The guard rides the whole request and frees its slot on drop.
     let max_inflight = { state.store.lock().await.settings.max_inflight };
     let Some(inflight) = try_admit(&state.inflight, max_inflight) else {
-        state.metrics.record_event("shed");
+        state.metrics.record_event("shed").await;
         return overloaded();
     };
 
@@ -628,7 +628,8 @@ pub async fn handle(
                 lane: None,
                 started: t0,
             },
-        );
+        )
+        .await;
         return Json(serde_json::json!({
             "default_generation_settings": { "n_ctx": n_ctx },
             "n_ctx": n_ctx,
@@ -671,7 +672,8 @@ pub async fn handle(
         let max_tok = v.get("max_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
         state
             .metrics
-            .record_shape(&client, n("messages"), n("tools"), max_tok, temp_x100);
+            .record_shape(&client, n("messages"), n("tools"), max_tok, temp_x100)
+            .await;
     }
     let streaming = parsed.as_ref().is_some_and(wants_stream);
     state.metrics.record_stream_mix(streaming);
@@ -720,233 +722,240 @@ pub async fn handle(
     }
 
     // Buffered path: walk the plan, failing over on retryable errors.
-    let pool_len = state.pool.read().unwrap().len();
-    let offering = state.catalog.providers_offering(&model_label);
-    let plan = resolve_plan(requested.as_deref(), &aliases, pool_len, &offering);
-    let last = plan.len().saturating_sub(1);
-    let mut excluded: Vec<usize> = Vec::new();
+
+    let excluded: Vec<_> = Default::default();
+
     loop {
-        for (i, step) in plan.iter().enumerate() {
-            let is_last = i == last;
-            // Model pressure is gated before the rate slot: a request that cannot run
-            // yet shouldn't be holding a key's budget while it waits.
-            let step_model = step.model.as_deref().unwrap_or(&model_label);
-            let Some(_model_permit) = admit_model(&state, step_model, deadline, || true).await
-            else {
-                state.metrics.record_event("deadline");
+        tokio::task::yield_now().await;
+
+        let lane_pool = state.pool.read().await;
+        let lanes = lane_pool.lanes();
+
+        let Some((lane, cooldown_until)) = select_best_lane(lanes, Instant::now()).await else {
+            // avoid spinlocking if somehow no models with cooldowns are available.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            continue;
+        };
+
+        if let Some(time) = cooldown_until.and_then(|t| t.checked_add(Duration::from_secs(1))) {
+            tokio::time::sleep_until(time.into()).await;
+        }
+
+        let queued_at = Instant::now();
+        print!("Waiting for state.dispatch.acquire_for()...");
+        let rate_slot = with_deadline(
+            deadline,
+            state.dispatch.acquire_for(
+                Some(lane.provider.as_str()),
+                &excluded,
+                session,
+                Some(wire),
+            ),
+        )
+        .await;
+        println!("  Done!");
+        // Distinguishes "our pool is the bottleneck" from "the provider is
+        // slow" — end to end they look identical.
+        state
+            .metrics
+            .record_queue_wait(queued_at.elapsed().as_millis() as u64)
+            .await;
+
+        let permit = match rate_slot {
+            None => {
+                state.metrics.record_event("deadline").await;
                 record(
                     &state,
                     RecordArgs {
                         client: &client,
                         virtual_model: &model_label,
-                        actual_model: Some(step_model),
+                        actual_model: Some(lane.model.as_str()),
                         path: &path_query,
                         status: "504",
                         lane: None,
                         started: t0,
                     },
-                );
+                )
+                .await;
                 return deadline_exceeded();
-            };
-            let queued_at = Instant::now();
-            let permit = match with_deadline(
-                deadline,
-                state.dispatch.acquire_for(
-                    step.provider.as_deref(),
-                    &excluded,
-                    session,
-                    Some(wire),
-                    Some(step_model),
-                ),
-            )
-            .await
-            {
-                None => {
-                    state.metrics.record_event("deadline");
-                    record(
-                        &state,
-                        RecordArgs {
-                            client: &client,
-                            virtual_model: &model_label,
-                            actual_model: Some(step_model),
-                            path: &path_query,
-                            status: "504",
-                            lane: None,
-                            started: t0,
-                        },
-                    );
-                    return deadline_exceeded();
-                }
-                Some(None) => continue, // no eligible lane for this target
-                Some(Some(p)) => p,
-            };
-            // Distinguishes "our pool is the bottleneck" from "the provider is
-            // slow" — end to end they look identical.
-            state
-                .metrics
-                .record_queue_wait(queued_at.elapsed().as_millis() as u64);
-            let out_body = rewrite_model(&body, step.model.as_deref());
-            let upstream_at = Instant::now();
-            let send = build_request(
-                &state,
-                &permit,
-                &rq_method,
-                &path_query,
-                &fwd_headers,
-                out_body,
-            )
-            .send();
-            let sent = match with_deadline(deadline, send).await {
-                Some(r) => r,
-                None => {
-                    state.metrics.record_event("deadline");
-                    record(
-                        &state,
-                        RecordArgs {
-                            client: &client,
-                            virtual_model: &model_label,
-                            actual_model: Some(step_model),
-                            path: &path_query,
-                            status: "504",
-                            lane: None,
-                            started: t0,
-                        },
-                    );
-                    return deadline_exceeded();
-                }
-            };
-            match sent {
-                Ok(resp) => {
-                    let status = resp.status().as_u16();
-                    let headers = resp.headers().to_owned();
-                    let payload = resp.bytes().await.unwrap_or_default();
+            }
+            Some(None) => continue, // no eligible lane for this target
+            Some(Some(p)) => p,
+        };
 
-                    // println!("{payload:#?}");
+        let out_body = rewrite_model(&body, Some(lane.model.as_str()));
+        let upstream_at = Instant::now();
 
-                    let cooldown = serde_json::from_slice::<serde_json::Value>(&payload)
-                        .ok()
-                        .as_ref()
-                        .and_then(serde_json::Value::as_array)
-                        .and_then(|x| {
-                            x.iter()
-                                .find_map(|x| x.as_object().and_then(|x| x.get("error")))
-                        })
-                        .and_then(serde_json::Value::as_object)
-                        .and_then(|x| x.get("details"))
-                        .and_then(serde_json::Value::as_array)
-                        .and_then(|x| {
-                            x.iter()
-                                .find_map(|x| x.as_object().and_then(|x| x.get("retryDelay")))
-                        })
-                        .inspect(|x| println!("⏱️ Payload suggested retry delay {x:?}."))
-                        .and_then(|x| {
-                            x.as_str()
-                                .map(str::trim)
-                                .map(|x| x.trim_suffix("s"))
-                                .and_then(|x| x.parse().ok())
-                                .or(x.as_u64())
-                                .or_else(|| {
-                                    eprintln!("⚠️ Couldn't parse retryDelay");
-                                    None
-                                })
-                        })
-                        .map(Duration::from_secs);
+        let response_future = build_request(
+            &state,
+            &permit,
+            &rq_method,
+            &path_query,
+            &fwd_headers,
+            out_body,
+        )
+        .send();
 
-                    if is_retryable(status) {
-                        let cooldown = retry_after(&headers)
-                            .or(cooldown)
-                            .or((status == 503).then_some(Duration::from_mins(20)));
+        let sent = match with_deadline(deadline, response_future).await {
+            Some(r) => r,
+            None => {
+                state.metrics.record_event("deadline").await;
+                record(
+                    &state,
+                    RecordArgs {
+                        client: &client,
+                        virtual_model: &model_label,
+                        actual_model: Some(lane.model.as_str()),
+                        path: &path_query,
+                        status: "504",
+                        lane: None,
+                        started: t0,
+                    },
+                )
+                .await;
+                return deadline_exceeded();
+            }
+        };
+        match sent {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let headers = resp.headers().to_owned();
+                let payload = resp.bytes().await.unwrap_or_default();
 
-                        if cooldown.is_none() {
-                            dbg!(&payload);
-                        }
+                // println!("{payload:#?}");
 
-                        // Bench even on the last step: this request is out of options,
-                        // but the next one shouldn't walk into the same wall.
-                        bench_lane(&state, permit.lane_idx, step_model, status, cooldown);
+                let cooldown = serde_json::from_slice::<serde_json::Value>(&payload)
+                    .ok()
+                    .as_ref()
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|x| {
+                        x.iter()
+                            .find_map(|x| x.as_object().and_then(|x| x.get("error")))
+                    })
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|x| x.get("details"))
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|x| {
+                        x.iter()
+                            .find_map(|x| x.as_object().and_then(|x| x.get("retryDelay")))
+                    })
+                    .inspect(|x| println!("⏱️ Payload suggested retry delay {x:?}."))
+                    .and_then(|x| {
+                        x.as_str()
+                            .map(str::trim)
+                            .map(|x| x.trim_suffix("s"))
+                            .and_then(|x| x.parse().ok())
+                            .or(x.as_u64())
+                            .or_else(|| {
+                                eprintln!("⚠️ Couldn't parse retryDelay");
+                                None
+                            })
+                    })
+                    .map(Duration::from_secs);
 
-                        state
-                            .governor
-                            .note_rebuff(step_model, permit.lane_idx, Instant::now());
+                if is_retryable(status) {
+                    let cooldown = retry_after(&headers)
+                        .or(cooldown)
+                        .or((status == 503).then_some(Duration::from_mins(20)));
 
-                        if !is_last {
-                            // excluded.push(permit.lane_idx);
-                            // println!("🚫 Lane {} added to the exclude list", permit.lane_idx);
-                            continue;
-                        }
+                    if cooldown.is_none() {
+                        dbg!(&payload);
                     }
 
-                    record(
-                        &state,
-                        RecordArgs {
-                            client: &client,
-                            virtual_model: &model_label,
-                            actual_model: Some(step_model),
-                            path: &path_query,
-                            status: &status.to_string(),
-                            lane: Some(permit.lane_idx),
-                            started: t0,
-                        },
-                    );
+                    // Bench even on the last step: this request is out of options,
+                    // but the next one shouldn't walk into the same wall.
+                    bench_lane(&state, permit.lane_idx, &lane.model, status, cooldown).await;
+
                     state
-                        .metrics
-                        .record_latency(&model_label, upstream_at.elapsed().as_millis() as u64);
-                    state.metrics.record_lane(&permit.provider);
-                    // On a buffered call the server generates the whole answer before
-                    // it sends anything, so "time to first byte" and "total time" are
-                    // the same number and there is no separate generation window.
-                    // Recording it as TTFT is still true — it is when the client
-                    // could first have seen anything — but the speed calculation has
-                    // to span the whole upstream exchange, not the part after
-                    // headers, which is why that column read zero.
-                    state
-                        .metrics
-                        .record_ttft(&model_label, upstream_at.elapsed().as_millis() as u64);
-                    // The body is read inside relay, so the clock has to be handed
-                    // in and stopped there. Calling elapsed() here measured the gap
-                    // between two adjacent statements — always zero, which is
-                    // exactly what the tokens/sec column showed.
-                    return relay(
-                        &state,
-                        &model_label,
-                        upstream_at,
-                        (status, headers, payload),
-                    )
+                        .governor
+                        .note_rebuff(&lane.model, permit.lane_idx, Instant::now())
+                        .await;
+
+                    // if !is_last {
+                    //     // excluded.push(permit.lane_idx);
+                    //     // println!("🚫 Lane {} added to the exclude list", permit.lane_idx);
+                    continue;
+                    // }
+                }
+
+                record(
+                    &state,
+                    RecordArgs {
+                        client: &client,
+                        virtual_model: &model_label,
+                        actual_model: Some(&lane.model),
+                        path: &path_query,
+                        status: &status.to_string(),
+                        lane: Some(permit.lane_idx),
+                        started: t0,
+                    },
+                )
+                .await;
+                state
+                    .metrics
+                    .record_latency(&model_label, upstream_at.elapsed().as_millis() as u64)
                     .await;
-                }
-                Err(e) => {
-                    if !is_last {
-                        excluded.push(permit.lane_idx);
-                        println!(
-                            "🚫 Lane {} added to the exclude list, cause:",
-                            permit.lane_idx
-                        );
-                        eprintln!("|   {}", e);
-                        continue;
-                    }
-                    record(
-                        &state,
-                        RecordArgs {
-                            client: &client,
-                            virtual_model: &model_label,
-                            actual_model: Some(step_model),
-                            path: &path_query,
-                            status: "502",
-                            lane: Some(permit.lane_idx),
-                            started: t0,
-                        },
-                    );
-                    return err(
-                        StatusCode::BAD_GATEWAY,
-                        "upstream_error",
-                        &format!("upstream request failed: {e}"),
-                    );
-                }
+                state.metrics.record_lane(&permit.provider).await;
+                // On a buffered call the server generates the whole answer before
+                // it sends anything, so "time to first byte" and "total time" are
+                // the same number and there is no separate generation window.
+                // Recording it as TTFT is still true — it is when the client
+                // could first have seen anything — but the speed calculation has
+                // to span the whole upstream exchange, not the part after
+                // headers, which is why that column read zero.
+                state
+                    .metrics
+                    .record_ttft(&model_label, upstream_at.elapsed().as_millis() as u64)
+                    .await;
+                // The body is read inside relay, so the clock has to be handed
+                // in and stopped there. Calling elapsed() here measured the gap
+                // between two adjacent statements — always zero, which is
+                // exactly what the tokens/sec column showed.
+                return relay(
+                    &state,
+                    &model_label,
+                    upstream_at,
+                    (status, headers, payload),
+                )
+                .await;
+            }
+            Err(e) => {
+                // if !is_last {
+                bench_lane(
+                    &state,
+                    permit.lane_idx,
+                    &lane.model,
+                    502,
+                    Some(Duration::from_mins(20)),
+                )
+                .await;
+
+                eprintln!("⚠️ Hit an error: {}", e);
+                continue;
+                // }
+                // record(
+                //     &state,
+                //     RecordArgs {
+                //         client: &client,
+                //         virtual_model: &model_label,
+                //         actual_model: Some(&lane.model),
+                //         path: &path_query,
+                //         status: "502",
+                //         lane: Some(permit.lane_idx),
+                //         started: t0,
+                //     },
+                // );
+                // return err(
+                //     StatusCode::BAD_GATEWAY,
+                //     "upstream_error",
+                //     &format!("upstream request failed: {e}"),
+                // );
             }
         }
+        // }
 
-        println!("Ran out of steps. Starting over in 61 seconds.");
-        tokio::time::sleep(Duration::from_secs(61)).await;
+        // println!("Ran out of steps. Starting over in 61 seconds.");
+        // tokio::time::sleep(Duration::from_secs(61)).await;
     }
     // record(
     //     &state,
@@ -966,6 +975,43 @@ pub async fn handle(
     //     "no_capacity",
     //     "no provider lane available for the requested model",
     // )
+}
+
+async fn select_best_lane<'a>(
+    lanes: impl IntoIterator<Item = &'a Lane>,
+    now: Instant,
+) -> Option<(&'a Lane, Option<Instant>)> {
+    #[derive(Debug)]
+    struct LaneRankCooldown<'a> {
+        rank: usize,
+        lane: &'a Lane,
+        cooldown_until: Option<Instant>,
+    }
+
+    let mut all = Vec::new();
+    for (rank, lane) in lanes.into_iter().enumerate() {
+        all.push(LaneRankCooldown {
+            rank,
+            lane,
+            cooldown_until: lane.cooldown_ends(now).await,
+        });
+    }
+
+    let best_time = all
+        .iter()
+        .map(|x| x.cooldown_until.unwrap_or(now))
+        .min()
+        .unwrap_or(now);
+
+    all.iter()
+        .filter(|x| {
+            x.cooldown_until.is_none_or(|x| {
+                x.checked_duration_since(best_time)
+                    .is_none_or(|x| x < Duration::from_secs(5)) // We add 5 seconds to allow for some margin of error in the host-reported retry delay, and also as some leeway for higher priority models
+            })
+        })
+        .min_by_key(|x| x.rank)
+        .map(|x| (x.lane, x.cooldown_until))
 }
 
 /// Learn a model's context ceiling from the provider's own complaint about it.
@@ -1035,7 +1081,7 @@ async fn relay(
                  either and retry",
             );
         }
-        harvest(&state.metrics, model, gen_ms, &v);
+        harvest(&state.metrics, model, gen_ms, &v).await;
     }
     (status, out, payload).into_response()
 }
@@ -1052,7 +1098,12 @@ async fn relay(
 /// under `message`, `message_delta` nests the stop reason under `delta` — so both
 /// nestings are checked, or a streamed Anthropic request records its output and
 /// none of its input.
-fn harvest(metrics: &crate::metrics::Metrics, model: &str, gen_ms: u64, v: &serde_json::Value) {
+async fn harvest(
+    metrics: &crate::metrics::Metrics,
+    model: &str,
+    gen_ms: u64,
+    v: &serde_json::Value,
+) {
     let nested_usage = v.get("message").and_then(|m| m.get("usage"));
     if let Some(u) = v.get("usage").or(nested_usage) {
         let n = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
@@ -1064,12 +1115,12 @@ fn harvest(metrics: &crate::metrics::Metrics, model: &str, gen_ms: u64, v: &serd
             pair => pair,
         };
         if p > 0 || c > 0 {
-            metrics.record_tokens(model, p, c);
+            metrics.record_tokens(model, p, c).await;
         }
         // A frame that reports no output tokens says nothing about speed;
         // recording it would average a real rate against a zero.
         if c > 0 {
-            metrics.record_speed(model, c, gen_ms);
+            metrics.record_speed(model, c, gen_ms).await;
         }
         let reasoning = u
             .get("completion_tokens_details")
@@ -1077,7 +1128,7 @@ fn harvest(metrics: &crate::metrics::Metrics, model: &str, gen_ms: u64, v: &serd
             .and_then(|x| x.as_u64())
             .unwrap_or(0);
         if reasoning > 0 {
-            metrics.record_extras(model, 0, reasoning);
+            metrics.record_extras(model, 0, reasoning).await;
         }
     }
     // Anthropic states how a generation ended at the top level when buffered, and
@@ -1088,7 +1139,7 @@ fn harvest(metrics: &crate::metrics::Metrics, model: &str, gen_ms: u64, v: &serd
         .or_else(|| v.get("delta").and_then(|d| d.get("stop_reason")))
         .and_then(|r| r.as_str())
     {
-        metrics.record_finish(model, reason);
+        metrics.record_finish(model, reason).await;
     }
     if let Some(blocks) = v.get("content").and_then(|c| c.as_array()) {
         let calls = blocks
@@ -1096,13 +1147,13 @@ fn harvest(metrics: &crate::metrics::Metrics, model: &str, gen_ms: u64, v: &serd
             .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
             .count() as u64;
         if calls > 0 {
-            metrics.record_extras(model, calls, 0);
+            metrics.record_extras(model, calls, 0).await;
         }
     }
     if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
         for ch in choices {
             if let Some(r) = ch.get("finish_reason").and_then(|r| r.as_str()) {
-                metrics.record_finish(model, r);
+                metrics.record_finish(model, r).await;
             }
             let calls = ch
                 .get("message")
@@ -1111,7 +1162,7 @@ fn harvest(metrics: &crate::metrics::Metrics, model: &str, gen_ms: u64, v: &serd
                 .map(|a| a.len() as u64)
                 .unwrap_or(0);
             if calls > 0 {
-                metrics.record_extras(model, calls, 0);
+                metrics.record_extras(model, calls, 0).await;
             }
         }
     }
@@ -1147,11 +1198,10 @@ async fn acquire_for_heartbeating(
     wire: Protocol,
     deadline: Option<Instant>,
     tx: &Tx,
-    model: Option<&str>,
 ) -> Result<Option<Permit>, ()> {
     let acq = state
         .dispatch
-        .acquire_for(provider, excluded, session, Some(wire), model);
+        .acquire_for(provider, excluded, session, Some(wire));
     tokio::pin!(acq);
     loop {
         let beat = tokio::time::sleep(HEARTBEAT);
@@ -1224,7 +1274,7 @@ async fn stream_proxy(
             let beat = || tx.try_send(heartbeat_frame()).is_ok() || !tx.is_closed();
 
             let Some(_model_permit) = admit_model(&state, step_model, deadline, beat).await else {
-                state.metrics.record_event("deadline");
+                state.metrics.record_event("deadline").await;
                 record(
                     &state,
                     RecordArgs {
@@ -1236,7 +1286,8 @@ async fn stream_proxy(
                         lane: None,
                         started: t0,
                     },
-                );
+                )
+                .await;
 
                 let _ = tx.send(sse_error("deadline_exceeded")).await;
                 return;
@@ -1251,19 +1302,19 @@ async fn stream_proxy(
                 wire,
                 deadline,
                 &tx,
-                Some(step_model),
             )
             .await
             {
                 Ok(Some(p)) => {
                     state
                         .metrics
-                        .record_queue_wait(queued_at.elapsed().as_millis() as u64);
+                        .record_queue_wait(queued_at.elapsed().as_millis() as u64)
+                        .await;
                     p
                 }
                 Ok(None) => continue,
                 Err(()) => {
-                    state.metrics.record_event("deadline");
+                    state.metrics.record_event("deadline").await;
                     record(
                         &state,
                         RecordArgs {
@@ -1275,7 +1326,8 @@ async fn stream_proxy(
                             lane: None,
                             started: t0,
                         },
-                    );
+                    )
+                    .await;
                     let _ = tx.send(sse_error("deadline_exceeded")).await;
                     return;
                 }
@@ -1298,7 +1350,7 @@ async fn stream_proxy(
                 let sent = match with_deadline(deadline, send).await {
                     Some(r) => r,
                     None => {
-                        state.metrics.record_event("deadline");
+                        state.metrics.record_event("deadline").await;
                         record(
                             &state,
                             RecordArgs {
@@ -1310,7 +1362,8 @@ async fn stream_proxy(
                                 lane: None,
                                 started: t0,
                             },
-                        );
+                        )
+                        .await;
                         let _ = tx.send(sse_error("deadline_exceeded")).await;
                         return;
                     }
@@ -1336,10 +1389,12 @@ async fn stream_proxy(
                             step_model,
                             resp.status().as_u16(),
                             retry_after(resp.headers()),
-                        );
+                        )
+                        .await;
                         state
                             .governor
-                            .note_rebuff(step_model, permit.lane_idx, Instant::now());
+                            .note_rebuff(step_model, permit.lane_idx, Instant::now())
+                            .await;
                         if !is_last {
                             excluded.push(permit.lane_idx);
                             continue;
@@ -1362,8 +1417,9 @@ async fn stream_proxy(
                             lane: Some(permit.lane_idx),
                             started: t0,
                         },
-                    );
-                    state.metrics.record_lane(&permit.provider);
+                    )
+                    .await;
+                    state.metrics.record_lane(&permit.provider).await;
                     stream_body(&state, &model, upstream_at, resp, deadline, &tx).await;
                     return;
                 }
@@ -1383,7 +1439,8 @@ async fn stream_proxy(
                             lane: Some(permit.lane_idx),
                             started: t0,
                         },
-                    );
+                    )
+                    .await;
                     let _ = tx.send(sse_error("upstream_error")).await;
                     return;
                 }
@@ -1432,7 +1489,7 @@ async fn stream_body(
     loop {
         match with_deadline(deadline, stream.next()).await {
             None => {
-                state.metrics.record_event("deadline");
+                state.metrics.record_event("deadline").await;
                 let _ = tx.send(sse_error("deadline_exceeded")).await;
                 return;
             }
@@ -1449,7 +1506,7 @@ async fn stream_body(
                             continue;
                         }
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(rest) {
-                            harvest(&state.metrics, model, gen_ms, &v);
+                            harvest(&state.metrics, model, gen_ms, &v).await;
                         }
                     }
                 }
@@ -1460,7 +1517,8 @@ async fn stream_body(
                     first_seen = Some(Instant::now());
                     state
                         .metrics
-                        .record_ttft(model, sent_at.elapsed().as_millis() as u64);
+                        .record_ttft(model, sent_at.elapsed().as_millis() as u64)
+                        .await;
                 }
                 // Keep only a trailing window: usage rides in the last frames and
                 // buffering a whole generation to find it would defeat streaming.
@@ -1469,12 +1527,12 @@ async fn stream_body(
                     tail = tail.split_off(tail.len() - 4096);
                 }
                 if tx.send(Ok(chunk)).await.is_err() {
-                    state.metrics.record_event("client_disconnect");
+                    state.metrics.record_event("client_disconnect").await;
                     return; // client hung up
                 }
             }
             Some(Some(Err(_))) => {
-                state.metrics.record_event("stream_error");
+                state.metrics.record_event("stream_error").await;
                 let _ = tx.send(sse_error("stream_error")).await;
                 return;
             }
@@ -1544,8 +1602,8 @@ mod tests {
             }
         });
         // 250 completion tokens in 5s = 50/sec.
-        harvest(&metrics, "m", 5000, &body);
-        metrics.record_request("c", "m", "200");
+        harvest(&metrics, "m", 5000, &body).await;
+        metrics.record_request("c", "m", "200").await;
 
         let stats = metrics.stats().await;
         let m = &stats.models[0];
