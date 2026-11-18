@@ -162,11 +162,23 @@ mod tests {
         let pool = Pool::with_window(vec![spec("a", 2), spec("b", 2)], Duration::from_secs(60));
         let d = Dispatcher::new(handle(pool));
         let s = Some(0xBEEFu64);
-        let first = d.acquire_for(None, &[], s, None, None).await.unwrap().lane_idx;
-        let second = d.acquire_for(None, &[], s, None, None).await.unwrap().lane_idx;
+        let first = d
+            .acquire_for(None, &[], s, None, None)
+            .await
+            .unwrap()
+            .lane_idx;
+        let second = d
+            .acquire_for(None, &[], s, None, None)
+            .await
+            .unwrap()
+            .lane_idx;
         assert_eq!(first, second, "a session should stay on its own lane");
         // That lane is now at its rpm of 2, so the third has to spill.
-        let third = d.acquire_for(None, &[], s, None, None).await.unwrap().lane_idx;
+        let third = d
+            .acquire_for(None, &[], s, None, None)
+            .await
+            .unwrap()
+            .lane_idx;
         assert_ne!(third, first, "a full affinity lane must spill, not block");
     }
 
